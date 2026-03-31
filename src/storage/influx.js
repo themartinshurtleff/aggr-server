@@ -52,9 +52,33 @@ class InfluxStorage {
     this.rawTradeCounter = 0
 
     /**
-     * CVD 24h cache: { [symbol]: { cvd_24h, cvd_24h_ts, expires } }
+     * Rolling 24h CVD (cumulative volume delta) accumulator.
+     * Uses a ring buffer of 10s buckets per symbol, fed in real-time
+     * by processTrades and seeded on startup from the bar cascade.
+     *
+     * cvdRing[symbol] = {
+     *   buckets: Float64Array(8640),  // 24h / 10s = 8640 slots, each holds delta (vbuy-vsell)
+     *   head: number,                 // current write index
+     *   headTime: number,             // floored timestamp of the head bucket
+     *   total: number,                // running sum of all buckets
+     *   seeded: boolean,              // whether initial seed from DB is done
+     * }
      */
-    this.cvdCache = {}
+    this.cvdRing = {}
+    this.CVD_BUCKET_MS = 10000 // 10 seconds per bucket
+    this.CVD_BUCKET_COUNT = (24 * 60 * 60 * 1000) / this.CVD_BUCKET_MS // 8640
+    this.CVD_SYMBOLS = ['BTC', 'ETH', 'SOL']
+    this.CVD_RECONCILE_INTERVAL = 5 * 60 * 1000 // reconcile every 5 minutes
+
+    for (const sym of this.CVD_SYMBOLS) {
+      this.cvdRing[sym] = {
+        buckets: new Float64Array(this.CVD_BUCKET_COUNT),
+        head: 0,
+        headTime: 0,
+        total: 0,
+        seeded: false
+      }
+    }
 
     /**
      * @type {{[pendingBarsRequestId: string]: (bars: Bar[]) => void}}
@@ -118,6 +142,9 @@ class InfluxStorage {
           await this.getPreviousBars()
         }
       }
+
+      // Seed CVD ring buffers from the bar cascade (works for both collect and api-only modes)
+      await this.seedCVD()
     } catch (error) {
       console.error(
         [
@@ -528,6 +555,9 @@ class InfluxStorage {
       }
     }
 
+    // Feed real-time trade deltas into CVD ring buffers
+    this.accumulateCVD(trades)
+
     await updateIndexes(ranges, async (index, high, low, direction) => {
       await alertService.checkPriceCrossover(index, high, low, direction)
     })
@@ -926,70 +956,210 @@ class InfluxStorage {
   }
 
   /**
-   * Compute rolling 24h CVD (cumulative volume delta) for a symbol.
-   * Uses the 30s bar cascade which has ~41h retention.
-   * Results are cached for 7 seconds per symbol.
-   *
-   * @param {string} symbol BTC, ETH, or SOL
-   * @returns {Promise<{cvd_24h: number, cvd_24h_ts: number}>}
+   * Seed CVD ring buffers from the 30s bar cascade on startup.
+   * Queries the last 24h of bars and fills the ring buffer so
+   * fetchCVD24h returns accurate data immediately.
    */
-  async fetchCVD24h(symbol) {
-    const now = Date.now()
-    const cached = this.cvdCache[symbol]
-    if (cached && cached.expires > now) {
-      return { cvd_24h: cached.cvd_24h, cvd_24h_ts: cached.cvd_24h_ts }
-    }
-
+  async seedCVD() {
     const SYMBOL_MARKETS = {
       'BTC': ['BINANCE_FUTURES:btcusdt', 'BYBIT:BTCUSDT', 'OKEX:BTC-USDT-SWAP', 'HYPERLIQUID:BTC'],
       'ETH': ['BINANCE_FUTURES:ethusdt', 'BYBIT:ETHUSDT', 'OKEX:ETH-USDT-SWAP', 'HYPERLIQUID:ETH'],
       'SOL': ['BINANCE_FUTURES:solusdt', 'BYBIT:SOLUSDT', 'OKEX:SOL-USDT-SWAP', 'HYPERLIQUID:SOL'],
     }
-    const markets = SYMBOL_MARKETS[symbol]
-    if (!markets) throw new Error('invalid symbol')
 
-    // Use 30s bars — finest granularity with 24h+ retention
     const barTfMs = 30000
     const barTfLabel = getHms(barTfMs)
     const rpName = config.influxRetentionPrefix + barTfLabel
     const measurement = config.influxMeasurement + '_' + barTfLabel
-    const marketFilter = markets.map(m => `market = '${m}'`).join(' OR ')
 
-    const query =
-      `SELECT sum(vbuy) AS vbuy, sum(vsell) AS vsell ` +
-      `FROM "${config.influxDatabase}"."${rpName}"."${measurement}" ` +
-      `WHERE time >= now() - 24h AND (${marketFilter}) ` +
-      `GROUP BY time(${barTfMs}ms) fill(none)`
+    for (const symbol of this.CVD_SYMBOLS) {
+      const ring = this.cvdRing[symbol]
+      const markets = SYMBOL_MARKETS[symbol]
+      const marketFilter = markets.map(m => `market = '${m}'`).join(' OR ')
 
-    let results
-    try {
-      results = await this.influx.queryRaw(query)
-    } catch (err) {
-      console.error('[storage/influx] fetchCVD24h query failed:', err.message)
-      throw err
-    }
+      const query =
+        `SELECT sum(vbuy) AS vbuy, sum(vsell) AS vsell ` +
+        `FROM "${config.influxDatabase}"."${rpName}"."${measurement}" ` +
+        `WHERE time >= now() - 24h AND (${marketFilter}) ` +
+        `GROUP BY time(${this.CVD_BUCKET_MS}ms) fill(none)`
 
-    let totalBuy = 0
-    let totalSell = 0
+      try {
+        const results = await this.influx.queryRaw(query)
 
-    if (results && results.results && results.results[0] &&
-        results.results[0].series && results.results[0].series[0]) {
-      const series = results.results[0].series[0]
-      const cols = series.columns
-      const vbuyIdx = cols.indexOf('vbuy')
-      const vsellIdx = cols.indexOf('vsell')
-      for (const row of series.values) {
-        totalBuy += row[vbuyIdx] || 0
-        totalSell += row[vsellIdx] || 0
+        // Reset ring
+        ring.buckets.fill(0)
+        ring.total = 0
+
+        const now = Date.now()
+        const windowStart = now - (this.CVD_BUCKET_COUNT * this.CVD_BUCKET_MS)
+        ring.headTime = Math.floor(now / this.CVD_BUCKET_MS) * this.CVD_BUCKET_MS
+        ring.head = 0
+
+        if (results && results.results && results.results[0] &&
+            results.results[0].series && results.results[0].series[0]) {
+          const series = results.results[0].series[0]
+          const cols = series.columns
+          const timeIdx = cols.indexOf('time')
+          const vbuyIdx = cols.indexOf('vbuy')
+          const vsellIdx = cols.indexOf('vsell')
+
+          for (const row of series.values) {
+            const ts = typeof row[timeIdx] === 'string'
+              ? new Date(row[timeIdx]).getTime()
+              : Math.floor(row[timeIdx])
+
+            if (ts < windowStart) continue
+
+            const bucketsAgo = Math.floor((ring.headTime - ts) / this.CVD_BUCKET_MS)
+            if (bucketsAgo < 0 || bucketsAgo >= this.CVD_BUCKET_COUNT) continue
+
+            // head is index 0, older buckets wrap backwards
+            const idx = ((ring.head - bucketsAgo) % this.CVD_BUCKET_COUNT + this.CVD_BUCKET_COUNT) % this.CVD_BUCKET_COUNT
+            const delta = (row[vbuyIdx] || 0) - (row[vsellIdx] || 0)
+            ring.buckets[idx] += delta
+            ring.total += delta
+          }
+        }
+
+        ring.seeded = true
+        console.log(`[cvd] seeded ${symbol} ring buffer: CVD = ${ring.total.toFixed(2)} USD`)
+      } catch (err) {
+        console.error(`[cvd] failed to seed ${symbol}:`, err.message)
       }
     }
 
-    const cvd = +(totalBuy - totalSell).toFixed(2)
-    const ts = now
+    // Schedule periodic reconciliation (only once, on first seed)
+    if (!this._cvdReconcileInterval) {
+      this._cvdReconcileInterval = setInterval(
+        () => this.reconcileCVD(),
+        this.CVD_RECONCILE_INTERVAL
+      )
+    }
+  }
 
-    this.cvdCache[symbol] = { cvd_24h: cvd, cvd_24h_ts: ts, expires: now + 7000 }
+  /**
+   * Advance the ring buffer for a symbol to the current time,
+   * zeroing out any buckets that have rolled past the 24h window.
+   * Returns the index for the current bucket.
+   *
+   * @param {string} symbol
+   * @param {number} now current time in ms
+   * @returns {number} index of the current bucket
+   */
+  advanceCVDRing(symbol, now) {
+    const ring = this.cvdRing[symbol]
+    const currentTime = Math.floor(now / this.CVD_BUCKET_MS) * this.CVD_BUCKET_MS
 
-    return { cvd_24h: cvd, cvd_24h_ts: ts }
+    if (ring.headTime === 0) {
+      // First use — initialize head
+      ring.headTime = currentTime
+      return ring.head
+    }
+
+    const elapsed = currentTime - ring.headTime
+    if (elapsed <= 0) return ring.head // still in the same bucket
+
+    const bucketsToAdvance = Math.min(
+      Math.floor(elapsed / this.CVD_BUCKET_MS),
+      this.CVD_BUCKET_COUNT
+    )
+
+    // Zero out each newly exposed bucket and subtract its old value from total
+    for (let i = 1; i <= bucketsToAdvance; i++) {
+      const idx = (ring.head + i) % this.CVD_BUCKET_COUNT
+      ring.total -= ring.buckets[idx]
+      ring.buckets[idx] = 0
+    }
+
+    ring.head = (ring.head + bucketsToAdvance) % this.CVD_BUCKET_COUNT
+    ring.headTime = currentTime
+
+    return ring.head
+  }
+
+  /**
+   * Accumulate trade deltas into the CVD ring buffer.
+   * Called from processTrades on every save cycle (~10s).
+   *
+   * @param {Trade[]} trades
+   */
+  accumulateCVD(trades) {
+    const deltas = {} // { symbol: { bucketTime: delta } }
+
+    for (let i = 0; i < trades.length; i++) {
+      const trade = trades[i]
+      if (trade.liquidation) continue
+
+      const market = trade.exchange + ':' + trade.pair
+      const symbol = this.RAW_TRADE_MARKETS[market]
+      if (!symbol) continue
+
+      const usdVol = trade.price * trade.size
+      const delta = trade.side === 'buy' ? usdVol : -usdVol
+      const bucketTime = Math.floor(trade.timestamp / this.CVD_BUCKET_MS) * this.CVD_BUCKET_MS
+
+      if (!deltas[symbol]) deltas[symbol] = {}
+      deltas[symbol][bucketTime] = (deltas[symbol][bucketTime] || 0) + delta
+    }
+
+    const now = Date.now()
+
+    for (const symbol in deltas) {
+      const ring = this.cvdRing[symbol]
+      if (!ring.seeded) continue
+
+      const headIdx = this.advanceCVDRing(symbol, now)
+
+      for (const bucketTimeStr in deltas[symbol]) {
+        const bucketTime = +bucketTimeStr
+        const bucketsAgo = Math.floor((ring.headTime - bucketTime) / this.CVD_BUCKET_MS)
+
+        // Discard if outside 24h window or in the future
+        if (bucketsAgo < 0 || bucketsAgo >= this.CVD_BUCKET_COUNT) continue
+
+        const idx = ((headIdx - bucketsAgo) % this.CVD_BUCKET_COUNT + this.CVD_BUCKET_COUNT) % this.CVD_BUCKET_COUNT
+        const delta = deltas[symbol][bucketTimeStr]
+        ring.buckets[idx] += delta
+        ring.total += delta
+      }
+    }
+  }
+
+  /**
+   * Reconcile CVD ring buffers against the bar cascade.
+   * Replaces the full ring with fresh DB data to correct any drift
+   * from missed trades, restarts, or floating point accumulation.
+   */
+  async reconcileCVD() {
+    try {
+      await this.seedCVD()
+    } catch (err) {
+      console.error('[cvd] reconciliation failed:', err.message)
+    }
+  }
+
+  /**
+   * Return the current 24h CVD for a symbol.
+   * Pure in-memory read — no DB query, no cache TTL.
+   *
+   * @param {string} symbol BTC, ETH, or SOL
+   * @returns {Promise<{cvd_24h: number, cvd_24h_ts: number}>}
+   */
+  async fetchCVD24h(symbol) {
+    const ring = this.cvdRing[symbol]
+    if (!ring) throw new Error('invalid symbol')
+
+    if (!ring.seeded) {
+      throw new Error('CVD data not yet available (seeding in progress)')
+    }
+
+    // Advance to expire old buckets before reading
+    this.advanceCVDRing(symbol, Date.now())
+
+    return {
+      cvd_24h: +ring.total.toFixed(2),
+      cvd_24h_ts: Date.now()
+    }
   }
 
   async writePoints(points, options, attempt = 0) {
