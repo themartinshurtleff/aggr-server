@@ -387,9 +387,6 @@ class InfluxStorage {
     }
 
     // convert the trades into bars (bars tf = minimum tf)
-    // Filter out trades with corrupted timestamps (>60s from now)
-    const now = Date.now()
-    trades = trades.filter(t => Math.abs((t.timestamp || t[1]) - now) < 60000)
     this.processTrades(trades)
 // Write raw trades for BTC/ETH/SOL footprint backfill
     await this.writeRawTrades(trades)

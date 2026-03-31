@@ -14,39 +14,19 @@ class InfluxStorage {
   constructor() {
     this.name = this.constructor.name
     this.format = 'point'
-    
-// Raw trade storage for aggregated footprint (BTC, ETH, SOL only)
+    // Raw trade storage for aggregated footprint (BTC, ETH, SOL only)
     this.RAW_TRADE_MARKETS = {
       'BINANCE_FUTURES:btcusdt': 'BTC',
       'BYBIT:BTCUSDT': 'BTC',
-      'OKEX:BTC-USDT-SWAP': 'BTC',
+      'OKX:BTC-USDT-SWAP': 'BTC',
       'HYPERLIQUID:BTC': 'BTC',
       'BINANCE_FUTURES:ethusdt': 'ETH',
       'BYBIT:ETHUSDT': 'ETH',
-      'OKEX:ETH-USDT-SWAP': 'ETH',
+      'OKX:ETH-USDT-SWAP': 'ETH',
       'HYPERLIQUID:ETH': 'ETH',
       'BINANCE_FUTURES:solusdt': 'SOL',
       'BYBIT:SOLUSDT': 'SOL',
-      'OKEX:SOL-USDT-SWAP': 'SOL',
-      'HYPERLIQUID:SOL': 'SOL',
-    }
-    this.rawTradeCounter = 0
-
-
-
-// Raw trade storage for aggregated footprint (BTC, ETH, SOL only)
-    this.RAW_TRADE_MARKETS = {
-      'BINANCE_FUTURES:btcusdt': 'BTC',
-      'BYBIT:BTCUSDT': 'BTC',
-      'OKEX:BTC-USDT-SWAP': 'BTC',
-      'HYPERLIQUID:BTC': 'BTC',
-      'BINANCE_FUTURES:ethusdt': 'ETH',
-      'BYBIT:ETHUSDT': 'ETH',
-      'OKEX:ETH-USDT-SWAP': 'ETH',
-      'HYPERLIQUID:ETH': 'ETH',
-      'BINANCE_FUTURES:solusdt': 'SOL',
-      'BYBIT:SOLUSDT': 'SOL',
-      'OKEX:SOL-USDT-SWAP': 'SOL',
+      'OKX:SOL-USDT-SWAP': 'SOL',
       'HYPERLIQUID:SOL': 'SOL',
     }
     this.rawTradeCounter = 0
@@ -387,9 +367,6 @@ class InfluxStorage {
     }
 
     // convert the trades into bars (bars tf = minimum tf)
-    // Filter out trades with corrupted timestamps (>60s from now)
-    const now = Date.now()
-    trades = trades.filter(t => Math.abs((t.timestamp || t[1]) - now) < 60000)
     this.processTrades(trades)
 // Write raw trades for BTC/ETH/SOL footprint backfill
     await this.writeRawTrades(trades)
@@ -672,14 +649,13 @@ class InfluxStorage {
 
       if (!symbol || trade.liquidation) continue
 
+      // Microsecond precision: ms * 1000 + counter to avoid overwrites
+      // for trades sharing the same millisecond and market tag
       const tsMicro = trade.timestamp * 1000 + (this.rawTradeCounter++ % 1000)
-      const TICK_SIZES = { 'BTC': 5.0, 'ETH': 0.5, 'SOL': 0.05 }
-      const tick = TICK_SIZES[symbol] || 1.0
-      const priceBucket = (Math.round(trade.price / tick) * tick).toFixed(2)
-      const sideTag = trade.side === 'buy' ? 'b' : 's'
+
       points.push({
         measurement: 'raw_trades',
-        tags: { market: market, symbol: symbol, pb: priceBucket, sd: sideTag },
+        tags: { market: market, symbol: symbol },
         fields: {
           price: +trade.price,
           size: +trade.size,
@@ -687,239 +663,28 @@ class InfluxStorage {
         },
         timestamp: tsMicro
       })
-
-      
     }
 
     if (points.length) {
-      try {
-        await this.writePoints(points, {
-          retentionPolicy: config.influxRetentionPrefix + 'raw',
-          precision: 'u'
-        })
-      } catch (err) {
-        console.error(
-          '[storage/influx] raw trade write failed:',
-          err.message || err
-        )
-      }
+      
     }
   }
 
 
-/**
-   * Fetch raw individual trades for a symbol within a time range
-   * Returns compact array-of-arrays: [[ts_ms, price, size, side, exchange], ...]
+
+
+
+
+  /**
+   * Wrapper for write
+   * Write points into db
+   * Called from importPendingBars
    *
-   * @param {string} symbol BTC, ETH, or SOL
-   * @param {number} from start time in ms
-   * @param {number} to end time in ms
-   * @returns {Promise<number[][]>}
+   * @param {Influx.IPoint[]} points
+   * @param {Influx.IWriteOptions} options
+   * @param {number?} attempt no of attempt starting at 0 (abort if too much failed attempts)
+   * @returns
    */
-  async fetchRawTrades(symbol, from, to) {
-    const rpName = config.influxRetentionPrefix + 'raw'
-    const query =
-      `SELECT price, size, side, market FROM "${config.influxDatabase}"."${rpName}"."raw_trades"` +
-      ` WHERE symbol = '${symbol}' AND time >= ${from}ms AND time < ${to}ms` +
-      ` ORDER BY time ASC LIMIT 500000`
-
-    let results
-    try {
-      results = await this.influx.queryRaw(query)
-    } catch (err) {
-      console.error('[storage/influx] fetchRawTrades query failed:', err.message)
-      throw err
-    }
-
-    if (
-      !results ||
-      !results.results ||
-      !results.results[0] ||
-      !results.results[0].series ||
-      !results.results[0].series[0]
-    ) {
-      return []
-    }
-
-    const series = results.results[0].series[0]
-    const cols = series.columns
-    const timeIdx = cols.indexOf('time')
-    const priceIdx = cols.indexOf('price')
-    const sizeIdx = cols.indexOf('size')
-    const sideIdx = cols.indexOf('side')
-    const marketIdx = cols.indexOf('market')
-
-    return series.values.map(row => {
-      // time comes back as ISO string from queryRaw
-      const ts = typeof row[timeIdx] === 'string'
-        ? new Date(row[timeIdx]).getTime()
-        : Math.floor(row[timeIdx])
-      return [
-        ts,
-        row[priceIdx],
-        row[sizeIdx],
-        row[sideIdx],
-        row[marketIdx].split(':')[0]
-      ]
-    })
-  }
-
-
-
-/**
-   * Fetch pre-aggregated footprint data for a symbol within a time range.
-   * Pulls OHLCV from the bar cascade and volume-at-price levels from raw trades.
-   *
-   * @param {string} symbol BTC, ETH, or SOL
-   * @param {number} from start time in ms
-   * @param {number} to end time in ms
-   * @param {number} timeframe candle width in ms (e.g. 60000 = 1m)
-   * @param {number} tickSize price bucket size (e.g. 5.0 for BTC)
-   * @returns {Promise<object>}
-   */
-  async fetchFootprint(symbol, from, to, timeframe, tickSize) {
-    const SYMBOL_MARKETS = {
-      'BTC': ['BINANCE_FUTURES:btcusdt', 'BYBIT:BTCUSDT', 'OKEX:BTC-USDT-SWAP', 'HYPERLIQUID:BTC'],
-      'ETH': ['BINANCE_FUTURES:ethusdt', 'BYBIT:ETHUSDT', 'OKEX:ETH-USDT-SWAP', 'HYPERLIQUID:ETH'],
-      'SOL': ['BINANCE_FUTURES:solusdt', 'BYBIT:SOLUSDT', 'OKEX:SOL-USDT-SWAP', 'HYPERLIQUID:SOL'],
-    }
-    const markets = SYMBOL_MARKETS[symbol]
-    if (!markets) throw new Error('invalid symbol')
-
-    // --- Step 1: OHLCV from bar cascade ---
-    const availableTimeframes = [config.influxTimeframe].concat(config.influxResampleTo)
-    let barTimeframe = null
-    for (const tf of availableTimeframes) {
-      if (tf === timeframe) { barTimeframe = tf; break }
-    }
-    if (!barTimeframe) {
-      const smaller = availableTimeframes.filter(tf => tf <= timeframe).sort((a, b) => b - a)
-      barTimeframe = smaller.length ? smaller[0] : availableTimeframes[0]
-    }
-    const barTfLabel = getHms(barTimeframe)
-    const rpName = config.influxRetentionPrefix + barTfLabel
-    const measurement = config.influxMeasurement + '_' + barTfLabel
-    const marketFilter = markets.map(m => `market = '${m}'`).join(' OR ')
-
-    const ohlcvQuery = `SELECT first(open) AS open, last(close) AS close, max(high) AS high, min(low) AS low, ` +
-      `sum(vbuy) AS vbuy, sum(vsell) AS vsell, sum(cbuy) AS cbuy, sum(csell) AS csell ` +
-      `FROM "${config.influxDatabase}"."${rpName}"."${measurement}" ` +
-      `WHERE time >= ${from}ms AND time < ${to}ms AND (${marketFilter}) ` +
-      `GROUP BY time(${timeframe}ms) fill(none)`
-
-    let ohlcvResults
-    try {
-      ohlcvResults = await this.influx.queryRaw(ohlcvQuery)
-    } catch (err) {
-      console.error('[storage/influx] fetchFootprint OHLCV query failed:', err.message)
-      throw err
-    }
-
-    const ohlcvMap = {}
-    if (ohlcvResults && ohlcvResults.results && ohlcvResults.results[0] &&
-        ohlcvResults.results[0].series && ohlcvResults.results[0].series[0]) {
-      const series = ohlcvResults.results[0].series[0]
-      const cols = series.columns
-      const timeIdx = cols.indexOf('time')
-      const openIdx = cols.indexOf('open')
-      const closeIdx = cols.indexOf('close')
-      const highIdx = cols.indexOf('high')
-      const lowIdx = cols.indexOf('low')
-      const vbuyIdx = cols.indexOf('vbuy')
-      const vsellIdx = cols.indexOf('vsell')
-      const cbuyIdx = cols.indexOf('cbuy')
-      const csellIdx = cols.indexOf('csell')
-      for (const row of series.values) {
-        const ts = typeof row[timeIdx] === 'string' ? new Date(row[timeIdx]).getTime() : Math.floor(row[timeIdx])
-        ohlcvMap[ts] = {
-          ts, open: row[openIdx], high: row[highIdx], low: row[lowIdx], close: row[closeIdx],
-          vol_buy: row[vbuyIdx] || 0, vol_sell: row[vsellIdx] || 0,
-          count_buy: row[cbuyIdx] || 0, count_sell: row[csellIdx] || 0,
-        }
-      }
-    }
-
-    // --- Step 2: Volume-at-price levels via InfluxDB native aggregation ---
-    const rawRpName = config.influxRetentionPrefix + 'raw'
-    const levelsQuery =
-      `SELECT SUM(size) AS vol, COUNT(size) AS cnt ` +
-      `FROM "${config.influxDatabase}"."${rawRpName}"."raw_trades" ` +
-      `WHERE symbol = '${symbol}' AND time >= ${from}ms AND time < ${to}ms ` +
-      `GROUP BY time(${timeframe}ms), pb, sd`
-
-    let levelsResults
-    try {
-      levelsResults = await this.influx.queryRaw(levelsQuery)
-    } catch (err) {
-      console.error('[storage/influx] fetchFootprint levels query failed:', err.message)
-      throw err
-    }
-
-    const levelsMap = {}
-    if (levelsResults && levelsResults.results && levelsResults.results[0] &&
-        levelsResults.results[0].series) {
-      for (const series of levelsResults.results[0].series) {
-        const priceLevel = parseFloat(series.tags.pb)
-        const isSell = series.tags.sd === 's'
-        const cols = series.columns
-        const timeIdx = cols.indexOf('time')
-        const volIdx = cols.indexOf('vol')
-        const cntIdx = cols.indexOf('cnt')
-        for (const row of series.values) {
-          const ts = typeof row[timeIdx] === 'string' ? new Date(row[timeIdx]).getTime() : Math.floor(row[timeIdx])
-          const vol = row[volIdx] || 0
-          const cnt = row[cntIdx] || 0
-          if (!levelsMap[ts]) levelsMap[ts] = {}
-          if (!levelsMap[ts][priceLevel]) {
-            levelsMap[ts][priceLevel] = { bv: 0, sv: 0, bc: 0, sc: 0 }
-          }
-          if (isSell) {
-            levelsMap[ts][priceLevel].sv += vol
-            levelsMap[ts][priceLevel].sc += cnt
-          } else {
-            levelsMap[ts][priceLevel].bv += vol
-            levelsMap[ts][priceLevel].bc += cnt
-          }
-        }
-      }
-    }
-
-    // --- Step 3: Merge OHLCV + levels ---
-    const allTimestamps = new Set([
-      ...Object.keys(ohlcvMap).map(Number),
-      ...Object.keys(levelsMap).map(Number)
-    ])
-    const candles = []
-    for (const ts of [...allTimestamps].sort((a, b) => a - b)) {
-      const ohlcv = ohlcvMap[ts]
-      const candleLevels = levelsMap[ts]
-      let levels = []
-      if (candleLevels) {
-        levels = Object.entries(candleLevels)
-          .map(([price, data]) => [
-            +parseFloat(price).toFixed(2),
-            +data.bv.toFixed(6),
-            +data.sv.toFixed(6),
-            data.bc,
-            data.sc
-          ])
-          .sort((a, b) => a[0] - b[0])
-      }
-      candles.push({
-        ts,
-        open: ohlcv ? ohlcv.open : null,
-        high: ohlcv ? ohlcv.high : null,
-        low: ohlcv ? ohlcv.low : null,
-        close: ohlcv ? ohlcv.close : null,
-        vol_buy: ohlcv ? ohlcv.vol_buy : 0,
-        vol_sell: ohlcv ? ohlcv.vol_sell : 0,
-        levels
-      })
-    }
-
-    return { symbol, timeframe, tick_size: tickSize, candles }
-  }
-
   async writePoints(points, options, attempt = 0) {
     if (!points.length) {
       return

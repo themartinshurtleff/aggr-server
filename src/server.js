@@ -1,5 +1,6 @@
 const EventEmitter = require('events')
 const fs = require('fs')
+const WebSocket = require('ws')
 const {
   getIp,
   getHms,
@@ -467,6 +468,139 @@ class Server extends EventEmitter {
           })
       }
     )
+    
+    // Raw trades endpoint for aggregated footprint backfill
+    app.get('/trades/:symbol/:from/:to', (req, res) => {
+      const symbol = (req.params.symbol || '').toUpperCase()
+      const from = parseInt(req.params.from)
+      const to = parseInt(req.params.to)
+
+      if (!['BTC', 'ETH', 'SOL'].includes(symbol)) {
+        return res.status(400).json({
+          error: 'invalid symbol, use BTC/ETH/SOL'
+        })
+      }
+
+      if (isNaN(from) || isNaN(to) || from >= to) {
+        return res.status(400).json({
+          error: 'invalid time range'
+        })
+      }
+
+      if (to - from > 12 * 60 * 60 * 1000) {
+        return res.status(400).json({
+          error: 'max range is 12 hours'
+        })
+      }
+
+      if (!config.api || !this.storages) {
+        return res.status(501).json({
+          error: 'no storage'
+        })
+      }
+
+      const storage = this.storages.find(
+        storage => storage.format === 'point'
+      )
+
+      if (!storage || typeof storage.fetchRawTrades !== 'function') {
+        return res.status(501).json({
+          error: 'no compatible storage'
+        })
+      }
+
+      storage
+        .fetchRawTrades(symbol, from, to)
+        .then(trades => {
+          if (trades.length > 10000) {
+            console.log(
+              `[trades] ${symbol} ${from}-${to}: ${trades.length} raw trades`
+            )
+          }
+          return res.status(200).json(trades)
+        })
+        .catch(err => {
+          return res.status(500).json({
+            error: err.message
+          })
+        })
+    })
+
+// Pre-aggregated footprint endpoint (OHLCV + volume-at-price levels)
+    app.get('/footprint/:symbol/:from/:to/:timeframe', (req, res) => {
+      const symbol = (req.params.symbol || '').toUpperCase()
+      const from = parseInt(req.params.from)
+      const to = parseInt(req.params.to)
+      const timeframe = parseInt(req.params.timeframe)
+
+      if (!['BTC', 'ETH', 'SOL'].includes(symbol)) {
+        return res.status(400).json({
+          error: 'invalid symbol, use BTC/ETH/SOL'
+        })
+      }
+
+      if (isNaN(from) || isNaN(to) || from >= to) {
+        return res.status(400).json({
+          error: 'invalid time range'
+        })
+      }
+
+      if (to - from > 12 * 60 * 60 * 1000) {
+        return res.status(400).json({
+          error: 'max range is 12 hours'
+        })
+      }
+
+      if (isNaN(timeframe) || timeframe < 10000) {
+        return res.status(400).json({
+          error: 'invalid timeframe (min 10000ms)'
+        })
+      }
+
+      // Default tick sizes per symbol, with optional override
+      const DEFAULT_TICK_SIZES = { 'BTC': 5.0, 'ETH': 0.50, 'SOL': 0.05 }
+      const tickSizeParam = parseFloat(req.query.tick_size)
+      const tickSize = (!isNaN(tickSizeParam) && tickSizeParam > 0)
+        ? tickSizeParam
+        : DEFAULT_TICK_SIZES[symbol]
+
+      if (!config.api || !this.storages) {
+        return res.status(501).json({
+          error: 'no storage'
+        })
+      }
+
+      const storage = this.storages.find(
+        storage => storage.format === 'point'
+      )
+
+      if (!storage || typeof storage.fetchFootprint !== 'function') {
+        return res.status(501).json({
+          error: 'no compatible storage'
+        })
+      }
+
+      const fetchStartAt = Date.now()
+
+      storage
+        .fetchFootprint(symbol, from, to, timeframe, tickSize)
+        .then(result => {
+          const elapsed = Date.now() - fetchStartAt
+          if (elapsed > 1000 || result.candles.length > 100) {
+            const totalLevels = result.candles.reduce((sum, c) => sum + c.levels.length, 0)
+            console.log(
+              `[footprint] ${symbol} ${result.candles.length} candles, ${totalLevels} levels, ${elapsed}ms`
+            )
+          }
+          return res.status(200).json(result)
+        })
+        .catch(err => {
+          console.error('[footprint] error:', err.message || err)
+          return res.status(500).json({
+            error: err.message
+          })
+        })
+    })
 
     app.use(function (err, req, res, _next) {
       if (err) {
@@ -484,8 +618,58 @@ class Server extends EventEmitter {
         !config.api ? '(historical api is disabled)' : ''
       )
     })
-
     this.app = app
+
+    // WebSocket broadcast server for live aggregated trades (BTC/ETH/SOL)
+    this.wss = new WebSocket.Server({ server: this.server, path: '/ws' })
+    this.wsClients = new Map() // ws -> Set<symbol>
+
+    this.RAW_TRADE_MARKETS = {
+      'BINANCE_FUTURES:btcusdt': 'BTC',
+      'BYBIT:BTCUSDT': 'BTC',
+      'OKEX:BTC-USDT-SWAP': 'BTC',
+      'HYPERLIQUID:BTC': 'BTC',
+      'BINANCE_FUTURES:ethusdt': 'ETH',
+      'BYBIT:ETHUSDT': 'ETH',
+      'OKEX:ETH-USDT-SWAP': 'ETH',
+      'HYPERLIQUID:ETH': 'ETH',
+      'BINANCE_FUTURES:solusdt': 'SOL',
+      'BYBIT:SOLUSDT': 'SOL',
+      'OKEX:SOL-USDT-SWAP': 'SOL',
+      'HYPERLIQUID:SOL': 'SOL',
+    }
+
+    this.wss.on('connection', (ws) => {
+      this.wsClients.set(ws, new Set())
+
+      ws.on('message', (data) => {
+        try {
+          const msg = JSON.parse(data)
+          if (msg.subscribe) {
+            const sym = msg.subscribe.toUpperCase()
+            if (['BTC', 'ETH', 'SOL'].includes(sym)) {
+              this.wsClients.get(ws).add(sym)
+            }
+          }
+          if (msg.unsubscribe) {
+            const sym = msg.unsubscribe.toUpperCase()
+            this.wsClients.get(ws).delete(sym)
+          }
+        } catch (_e) {
+          // ignore malformed messages
+        }
+      })
+
+      ws.on('close', () => {
+        this.wsClients.delete(ws)
+      })
+
+      ws.on('error', () => {
+        this.wsClients.delete(ws)
+      })
+    })
+
+    console.log(`[server] websocket broadcast available at ws://localhost:${config.port}/ws`)
   }
 
   monitorUsage() {
@@ -765,27 +949,59 @@ class Server extends EventEmitter {
    */
 
   dispatchRawTrades(trades) {
+    // Batch WS broadcasts per symbol
+    const wsBatches = {}
+
     for (let i = 0; i < trades.length; i++) {
       const trade = trades[i]
-
       if (!trade.size) {
         continue
       }
-
       if (!trade.liquidation) {
         const identifier = trade.exchange + ':' + trade.pair
-
         // ping connection
         connections[identifier].hit++
-
         if (trade.timestamp > connections[identifier].timestamp) {
           connections[identifier].timestamp = trade.timestamp
         }
-      }
 
+        // buffer for WS broadcast (BTC/ETH/SOL only, non-liquidation)
+        const symbol = this.RAW_TRADE_MARKETS[identifier]
+        if (symbol) {
+          if (!wsBatches[symbol]) {
+            wsBatches[symbol] = []
+          }
+          wsBatches[symbol].push([
+            trade.timestamp,
+            +trade.price,
+            +trade.size,
+            trade.side === 'buy' ? 0 : 1,
+            trade.exchange
+          ])
+        }
+      }
       // save trade
       if (this.storages) {
         this.chunk.push(trade)
+      }
+    }
+
+    // Broadcast to subscribed WS clients
+    if (this.wsClients && this.wsClients.size > 0) {
+      const serialized = {}
+      for (const [ws, symbols] of this.wsClients) {
+        if (ws.readyState !== WebSocket.OPEN) continue
+        for (const sym of symbols) {
+          if (!wsBatches[sym] || !wsBatches[sym].length) continue
+          if (!serialized[sym]) {
+            serialized[sym] = JSON.stringify({ symbol: sym, trades: wsBatches[sym] })
+          }
+          try {
+            ws.send(serialized[sym])
+          } catch (_e) {
+            // client gone, will be cleaned up on close
+          }
+        }
       }
     }
   }
