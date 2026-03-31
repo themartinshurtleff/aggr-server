@@ -52,6 +52,11 @@ class InfluxStorage {
     this.rawTradeCounter = 0
 
     /**
+     * CVD 24h cache: { [symbol]: { cvd_24h, cvd_24h_ts, expires } }
+     */
+    this.cvdCache = {}
+
+    /**
      * @type {{[pendingBarsRequestId: string]: (bars: Bar[]) => void}}
      */
     this.promisesOfPendingBars = {}
@@ -918,6 +923,73 @@ class InfluxStorage {
     }
 
     return { symbol, timeframe, tick_size: tickSize, candles }
+  }
+
+  /**
+   * Compute rolling 24h CVD (cumulative volume delta) for a symbol.
+   * Uses the 30s bar cascade which has ~41h retention.
+   * Results are cached for 7 seconds per symbol.
+   *
+   * @param {string} symbol BTC, ETH, or SOL
+   * @returns {Promise<{cvd_24h: number, cvd_24h_ts: number}>}
+   */
+  async fetchCVD24h(symbol) {
+    const now = Date.now()
+    const cached = this.cvdCache[symbol]
+    if (cached && cached.expires > now) {
+      return { cvd_24h: cached.cvd_24h, cvd_24h_ts: cached.cvd_24h_ts }
+    }
+
+    const SYMBOL_MARKETS = {
+      'BTC': ['BINANCE_FUTURES:btcusdt', 'BYBIT:BTCUSDT', 'OKEX:BTC-USDT-SWAP', 'HYPERLIQUID:BTC'],
+      'ETH': ['BINANCE_FUTURES:ethusdt', 'BYBIT:ETHUSDT', 'OKEX:ETH-USDT-SWAP', 'HYPERLIQUID:ETH'],
+      'SOL': ['BINANCE_FUTURES:solusdt', 'BYBIT:SOLUSDT', 'OKEX:SOL-USDT-SWAP', 'HYPERLIQUID:SOL'],
+    }
+    const markets = SYMBOL_MARKETS[symbol]
+    if (!markets) throw new Error('invalid symbol')
+
+    // Use 30s bars — finest granularity with 24h+ retention
+    const barTfMs = 30000
+    const barTfLabel = getHms(barTfMs)
+    const rpName = config.influxRetentionPrefix + barTfLabel
+    const measurement = config.influxMeasurement + '_' + barTfLabel
+    const marketFilter = markets.map(m => `market = '${m}'`).join(' OR ')
+
+    const query =
+      `SELECT sum(vbuy) AS vbuy, sum(vsell) AS vsell ` +
+      `FROM "${config.influxDatabase}"."${rpName}"."${measurement}" ` +
+      `WHERE time >= now() - 24h AND (${marketFilter}) ` +
+      `GROUP BY time(${barTfMs}ms) fill(none)`
+
+    let results
+    try {
+      results = await this.influx.queryRaw(query)
+    } catch (err) {
+      console.error('[storage/influx] fetchCVD24h query failed:', err.message)
+      throw err
+    }
+
+    let totalBuy = 0
+    let totalSell = 0
+
+    if (results && results.results && results.results[0] &&
+        results.results[0].series && results.results[0].series[0]) {
+      const series = results.results[0].series[0]
+      const cols = series.columns
+      const vbuyIdx = cols.indexOf('vbuy')
+      const vsellIdx = cols.indexOf('vsell')
+      for (const row of series.values) {
+        totalBuy += row[vbuyIdx] || 0
+        totalSell += row[vsellIdx] || 0
+      }
+    }
+
+    const cvd = +(totalBuy - totalSell).toFixed(2)
+    const ts = now
+
+    this.cvdCache[symbol] = { cvd_24h: cvd, cvd_24h_ts: ts, expires: now + 7000 }
+
+    return { cvd_24h: cvd, cvd_24h_ts: ts }
   }
 
   async writePoints(points, options, attempt = 0) {

@@ -582,9 +582,13 @@ class Server extends EventEmitter {
 
       const fetchStartAt = Date.now()
 
-      storage
-        .fetchFootprint(symbol, from, to, timeframe, tickSize)
-        .then(result => {
+      Promise.all([
+        storage.fetchFootprint(symbol, from, to, timeframe, tickSize),
+        typeof storage.fetchCVD24h === 'function'
+          ? storage.fetchCVD24h(symbol).catch(() => null)
+          : Promise.resolve(null)
+      ])
+        .then(([result, cvd]) => {
           const elapsed = Date.now() - fetchStartAt
           if (elapsed > 1000 || result.candles.length > 100) {
             const totalLevels = result.candles.reduce((sum, c) => sum + c.levels.length, 0)
@@ -592,10 +596,57 @@ class Server extends EventEmitter {
               `[footprint] ${symbol} ${result.candles.length} candles, ${totalLevels} levels, ${elapsed}ms`
             )
           }
+          if (cvd) {
+            result.cvd_24h = cvd.cvd_24h
+            result.cvd_24h_ts = cvd.cvd_24h_ts
+          }
           return res.status(200).json(result)
         })
         .catch(err => {
           console.error('[footprint] error:', err.message || err)
+          return res.status(500).json({
+            error: err.message
+          })
+        })
+    })
+
+    // Lightweight CVD-only endpoint
+    app.get('/cvd/:symbol', (req, res) => {
+      const symbol = (req.params.symbol || '').toUpperCase()
+
+      if (!['BTC', 'ETH', 'SOL'].includes(symbol)) {
+        return res.status(400).json({
+          error: 'invalid symbol, use BTC/ETH/SOL'
+        })
+      }
+
+      if (!config.api || !this.storages) {
+        return res.status(501).json({
+          error: 'no storage'
+        })
+      }
+
+      const storage = this.storages.find(
+        storage => storage.format === 'point'
+      )
+
+      if (!storage || typeof storage.fetchCVD24h !== 'function') {
+        return res.status(501).json({
+          error: 'no compatible storage'
+        })
+      }
+
+      storage
+        .fetchCVD24h(symbol)
+        .then(result => {
+          return res.status(200).json({
+            symbol,
+            cvd_24h: result.cvd_24h,
+            cvd_24h_ts: result.cvd_24h_ts
+          })
+        })
+        .catch(err => {
+          console.error('[cvd] error:', err.message || err)
           return res.status(500).json({
             error: err.message
           })
