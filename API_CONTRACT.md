@@ -3,7 +3,7 @@
 **Single source of truth for all data exchanged between the Python backend and the Rust frontend.**
 This file must live in both repos. Any change to an endpoint's response format, units, or behavior MUST be reflected here FIRST, then in both CLAUDE.md files.
 
-Last verified against backend code: March 30, 2026
+Last verified against backend code: April 1, 2026
 
 ---
 
@@ -641,6 +641,7 @@ These endpoints are used by AGGREGATED tickers for trade data and footprint.
       "close": 69480.0,
       "vol_buy": 145230.50,
       "vol_sell": 132870.25,
+      "cvd": 12360.25,
       "levels": [
         [69310.0, 2.31, 1.87, 45, 38]
       ]
@@ -654,6 +655,7 @@ These endpoints are used by AGGREGATED tickers for trade data and footprint.
 | `cvd_24h` | float | **USD** | Rolling 24h cumulative volume delta (buy vol - sell vol) across all 4 exchanges. Same value as `/cvd/{symbol}` endpoint. |
 | `cvd_24h_ts` | int | **Milliseconds** | Timestamp of CVD computation |
 | `candles[].vol_buy/vol_sell` | float | **USD** | USD notional from 4 exchanges |
+| `candles[].cvd` | float | **USD** | Running cumulative volume delta (vol_buy - vol_sell) from first candle in response. Frontend can anchor to `cvd_24h` via offset. |
 | `candles[].levels[][1-2]` | float | **Base asset** | Buy/sell volume per price level in base |
 | `candles[].levels[][3-4]` | int | — | Buy/sell trade count |
 | `candles[].open/high/low/close` | float or null | USD | Null = current incomplete candle (skip it) |
@@ -666,7 +668,7 @@ These endpoints are used by AGGREGATED tickers for trade data and footprint.
 
 **Purpose:** Rolling 24-hour cumulative volume delta (buy volume minus sell volume) in USD across all 4 exchanges.
 **Update rate:** Every ~10 seconds from live trade data, reconciled against the bar cascade every 5 minutes.
-**Cache:** 5-10s in-memory.
+**Cache:** None — pure in-memory ring buffer read (no DB query, no TTL).
 
 **Parameters:**
 
