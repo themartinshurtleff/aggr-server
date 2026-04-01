@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Aggr-server API
-  version: 1.0.0
+  version: 1.1.0
 servers:
   - url: https://api.aggr.trade/
     description: AGGR Trade server
@@ -50,25 +50,25 @@ paths:
           schema:
             type: integer
           required: true
-          description: Start timestamp of the historical data
+          description: Start timestamp in milliseconds
         - in: path
           name: to
           schema:
             type: integer
           required: true
-          description: End timestamp of the historical data
+          description: End timestamp in milliseconds
         - in: path
           name: timeframe
           schema:
-            type: string
-          required: true          
-          description: Timeframe of the historical data
+            type: integer
+          required: false
+          description: Timeframe in milliseconds (default 60000)
         - in: path
           name: markets
           schema:
             type: string
-          description: Markets to fetch historical data for
-          required: true
+          required: false
+          description: Markets separated by + (e.g. BINANCE_FUTURES:btcusdt+BYBIT:BTCUSDT)
       responses:
         '200':
           description: Successful response
@@ -94,6 +94,165 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+
+  /trades/{symbol}/{from}/{to}:
+    get:
+      summary: Get raw individual trades for a symbol
+      description: Returns compact array-of-arrays from the 12h raw trade retention policy.
+      parameters:
+        - in: path
+          name: symbol
+          schema:
+            type: string
+            enum: [BTC, ETH, SOL]
+          required: true
+          description: Symbol (case-insensitive)
+        - in: path
+          name: from
+          schema:
+            type: integer
+          required: true
+          description: Start timestamp in milliseconds
+        - in: path
+          name: to
+          schema:
+            type: integer
+          required: true
+          description: End timestamp in milliseconds
+      responses:
+        '200':
+          description: Array of raw trades
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RawTradesResponse'
+        '400':
+          description: Invalid symbol or time range (max 12 hours)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '501':
+          description: No compatible storage
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /footprint/{symbol}/{from}/{to}/{timeframe}:
+    get:
+      summary: Get pre-aggregated footprint data (OHLCV + volume-at-price levels + CVD)
+      description: >
+        Returns OHLCV candles with per-price-level volume breakdowns and a rolling
+        24h cumulative volume delta. Aggregates data from Binance, Bybit, OKX, and
+        Hyperliquid for the given symbol.
+      parameters:
+        - in: path
+          name: symbol
+          schema:
+            type: string
+            enum: [BTC, ETH, SOL]
+          required: true
+          description: Symbol (case-insensitive)
+        - in: path
+          name: from
+          schema:
+            type: integer
+          required: true
+          description: Start timestamp in milliseconds
+        - in: path
+          name: to
+          schema:
+            type: integer
+          required: true
+          description: End timestamp in milliseconds
+        - in: path
+          name: timeframe
+          schema:
+            type: integer
+          required: true
+          description: Candle width in milliseconds (minimum 10000)
+        - in: query
+          name: tick_size
+          schema:
+            type: number
+          required: false
+          description: >
+            Price bucket size for volume-at-price levels. Defaults per symbol:
+            BTC=5.0, ETH=0.50, SOL=0.05
+      responses:
+        '200':
+          description: Footprint data with candles, levels, and 24h CVD
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FootprintResponse'
+        '400':
+          description: Invalid symbol, time range (max 12 hours), or timeframe
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '501':
+          description: No compatible storage
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /cvd/{symbol}:
+    get:
+      summary: Get rolling 24h cumulative volume delta for a symbol
+      description: >
+        Lightweight endpoint returning only the 24h CVD value (buy volume minus
+        sell volume in USD across Binance, Bybit, OKX, and Hyperliquid).
+        Backed by an in-memory ring buffer that updates every ~10 seconds.
+      parameters:
+        - in: path
+          name: symbol
+          schema:
+            type: string
+            enum: [BTC, ETH, SOL]
+          required: true
+          description: Symbol (case-insensitive)
+      responses:
+        '200':
+          description: CVD value
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CVDResponse'
+        '400':
+          description: Invalid symbol
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '501':
+          description: No compatible storage
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: CVD not yet seeded or internal error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
 components:
   schemas:
     AlertPayload:
@@ -116,7 +275,7 @@ components:
         - price
     AlertResponse:
       type: object
-        
+
     Error:
       type: object
       properties:
@@ -133,32 +292,9 @@ components:
           type: string
         columns:
           type: object
-          properties:
-            time:
-              type: integer
-            cbuy:
-              type: integer
-            close:
-              type: integer
-            csell:
-              type: integer
-            high:
-              type: integer
-            lbuy:
-              type: integer
-            low:
-              type: integer
-            lsell:
-              type: integer
-            market:
-              type: string
-            open:
-              type: integer
-            vbuy:
-              type: number
-            vsell:
-              type: number
-          nullable: true
+          description: Map of column name to index position
+          additionalProperties:
+            type: integer
         results:
           type: array
           items:
@@ -169,4 +305,89 @@ components:
                 - type: number
                 - type: string
             nullable: true
-              
+
+    RawTradesResponse:
+      type: array
+      description: Array of trades, each as [ts_ms, price, size, side, exchange]
+      items:
+        type: array
+        items:
+          oneOf:
+            - type: integer
+            - type: number
+            - type: string
+        minItems: 5
+        maxItems: 5
+
+    FootprintResponse:
+      type: object
+      properties:
+        symbol:
+          type: string
+          enum: [BTC, ETH, SOL]
+        timeframe:
+          type: integer
+          description: Candle width in milliseconds
+        tick_size:
+          type: number
+          description: Price bucket size used for levels
+        cvd_24h:
+          type: number
+          description: Rolling 24h cumulative volume delta in USD (buy - sell)
+        cvd_24h_ts:
+          type: integer
+          description: Timestamp of the CVD computation in milliseconds
+        candles:
+          type: array
+          items:
+            $ref: '#/components/schemas/FootprintCandle'
+
+    FootprintCandle:
+      type: object
+      properties:
+        ts:
+          type: integer
+          description: Candle timestamp in milliseconds
+        open:
+          type: number
+          nullable: true
+        high:
+          type: number
+          nullable: true
+        low:
+          type: number
+          nullable: true
+        close:
+          type: number
+          nullable: true
+        vol_buy:
+          type: number
+          description: Total buy volume in USD
+        vol_sell:
+          type: number
+          description: Total sell volume in USD
+        cvd:
+          type: number
+          description: Running cumulative volume delta (vol_buy - vol_sell) from first candle
+        levels:
+          type: array
+          description: Volume-at-price levels, each as [price, buy_vol, sell_vol, buy_count, sell_count]
+          items:
+            type: array
+            items:
+              type: number
+            minItems: 5
+            maxItems: 5
+
+    CVDResponse:
+      type: object
+      properties:
+        symbol:
+          type: string
+          enum: [BTC, ETH, SOL]
+        cvd_24h:
+          type: number
+          description: Rolling 24h cumulative volume delta in USD (buy - sell)
+        cvd_24h_ts:
+          type: integer
+          description: Timestamp of the computation in milliseconds
