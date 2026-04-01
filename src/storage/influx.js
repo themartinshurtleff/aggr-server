@@ -925,6 +925,7 @@ class InfluxStorage {
       ...Object.keys(levelsMap).map(Number)
     ])
     const candles = []
+    let cvdAcc = 0
     for (const ts of [...allTimestamps].sort((a, b) => a - b)) {
       const ohlcv = ohlcvMap[ts]
       const candleLevels = levelsMap[ts]
@@ -940,14 +941,18 @@ class InfluxStorage {
           ])
           .sort((a, b) => a[0] - b[0])
       }
+      const volBuy = ohlcv ? ohlcv.vol_buy : 0
+      const volSell = ohlcv ? ohlcv.vol_sell : 0
+      cvdAcc += volBuy - volSell
       candles.push({
         ts,
         open: ohlcv ? ohlcv.open : null,
         high: ohlcv ? ohlcv.high : null,
         low: ohlcv ? ohlcv.low : null,
         close: ohlcv ? ohlcv.close : null,
-        vol_buy: ohlcv ? ohlcv.vol_buy : 0,
-        vol_sell: ohlcv ? ohlcv.vol_sell : 0,
+        vol_buy: volBuy,
+        vol_sell: volSell,
+        cvd: +cvdAcc.toFixed(2),
         levels
       })
     }
