@@ -941,15 +941,38 @@ class InfluxStorage {
           ])
           .sort((a, b) => a[0] - b[0])
       }
-      const volBuy = ohlcv ? ohlcv.vol_buy : 0
-      const volSell = ohlcv ? ohlcv.vol_sell : 0
+      let volBuy = ohlcv ? ohlcv.vol_buy : 0
+      let volSell = ohlcv ? ohlcv.vol_sell : 0
+      let open = ohlcv ? ohlcv.open : null
+      let high = ohlcv ? ohlcv.high : null
+      let low = ohlcv ? ohlcv.low : null
+      let close = ohlcv ? ohlcv.close : null
+
+      // When levels exist but OHLCV hasn't resampled yet (incomplete candle),
+      // derive volume and OHLC from the levels data so the candle is self-consistent
+      if (!ohlcv && levels.length) {
+        for (let l = 0; l < levels.length; l++) {
+          const price = levels[l][0]
+          const bv = levels[l][1] // base asset
+          const sv = levels[l][2] // base asset
+          volBuy += bv * price
+          volSell += sv * price
+        }
+        volBuy = +volBuy.toFixed(2)
+        volSell = +volSell.toFixed(2)
+        open = levels[0][0]
+        high = levels[levels.length - 1][0]
+        low = levels[0][0]
+        close = levels[levels.length - 1][0]
+      }
+
       cvdAcc += volBuy - volSell
       candles.push({
         ts,
-        open: ohlcv ? ohlcv.open : null,
-        high: ohlcv ? ohlcv.high : null,
-        low: ohlcv ? ohlcv.low : null,
-        close: ohlcv ? ohlcv.close : null,
+        open,
+        high,
+        low,
+        close,
         vol_buy: volBuy,
         vol_sell: volSell,
         cvd: +cvdAcc.toFixed(2),

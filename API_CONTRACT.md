@@ -658,9 +658,11 @@ These endpoints are used by AGGREGATED tickers for trade data and footprint.
 | `candles[].cvd` | float | **USD** | Running cumulative volume delta (vol_buy - vol_sell) from first candle in response. Frontend can anchor to `cvd_24h` via offset. |
 | `candles[].levels[][1-2]` | float | **Base asset** | Buy/sell volume per price level in base |
 | `candles[].levels[][3-4]` | int | — | Buy/sell trade count |
-| `candles[].open/high/low/close` | float or null | USD | Null = current incomplete candle (skip it) |
+| `candles[].open/high/low/close` | float or null | USD | Null only if candle has zero data from both sources (extremely rare). See incomplete candle note below. |
 
 **⚠️ VOLUME UNIT MISMATCH:** Candle-level `vol_buy/vol_sell` are in **USD**. Level-level volumes are in **base asset**. The frontend stores `Kline.volume` as `(buy, sell)` — for AGGREGATED panes, these are already USD from this endpoint. For Binance kline backfill of older candles, volumes are base asset and get converted to USD at insertion time in `insert_hist_klines()`.
+
+**⚠️ INCOMPLETE (CURRENT) CANDLE:** The OHLCV bar cascade resamples every 60 seconds, but raw trades (used for levels) are written every 10 seconds. For the current candle period, levels may have data before the bar cascade does. When this happens, the server derives OHLCV from the levels: `vol_buy`/`vol_sell` are computed by summing `level_buy_vol * level_price` across all levels (base→USD), and OHLC is taken from the sorted level prices (open/low = lowest price bucket, high/close = highest price bucket). This is approximate (price-bucket resolution, not tick-level) but makes the candle self-consistent. The frontend should overwrite OHLC with live trade data as it arrives.
 
 ---
 
