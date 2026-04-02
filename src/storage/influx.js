@@ -853,23 +853,44 @@ class InfluxStorage {
     const ohlcvMap = {}
     if (ohlcvResults && ohlcvResults.results && ohlcvResults.results[0] &&
         ohlcvResults.results[0].series && ohlcvResults.results[0].series[0]) {
-      const series = ohlcvResults.results[0].series[0]
-      const cols = series.columns
-      const timeIdx = cols.indexOf('time')
-      const openIdx = cols.indexOf('open')
-      const closeIdx = cols.indexOf('close')
-      const highIdx = cols.indexOf('high')
-      const lowIdx = cols.indexOf('low')
-      const vbuyIdx = cols.indexOf('vbuy')
-      const vsellIdx = cols.indexOf('vsell')
-      const cbuyIdx = cols.indexOf('cbuy')
-      const csellIdx = cols.indexOf('csell')
-      for (const row of series.values) {
-        const ts = typeof row[timeIdx] === 'string' ? new Date(row[timeIdx]).getTime() : Math.floor(row[timeIdx])
-        ohlcvMap[ts] = {
-          ts, open: row[openIdx], high: row[highIdx], low: row[lowIdx], close: row[closeIdx],
-          vol_buy: row[vbuyIdx] || 0, vol_sell: row[vsellIdx] || 0,
-          count_buy: row[cbuyIdx] || 0, count_sell: row[csellIdx] || 0,
+      for (const series of ohlcvResults.results[0].series) {
+        const cols = series.columns
+        const timeIdx = cols.indexOf('time')
+        const openIdx = cols.indexOf('open')
+        const closeIdx = cols.indexOf('close')
+        const highIdx = cols.indexOf('high')
+        const lowIdx = cols.indexOf('low')
+        const vbuyIdx = cols.indexOf('vbuy')
+        const vsellIdx = cols.indexOf('vsell')
+        const cbuyIdx = cols.indexOf('cbuy')
+        const csellIdx = cols.indexOf('csell')
+        for (const row of series.values) {
+          const ts = typeof row[timeIdx] === 'string' ? new Date(row[timeIdx]).getTime() : Math.floor(row[timeIdx])
+          if (!ohlcvMap[ts]) {
+            ohlcvMap[ts] = {
+              ts, open: row[openIdx], high: row[highIdx], low: row[lowIdx], close: row[closeIdx],
+              vol_buy: row[vbuyIdx] || 0, vol_sell: row[vsellIdx] || 0,
+              count_buy: row[cbuyIdx] || 0, count_sell: row[csellIdx] || 0,
+            }
+          } else {
+            const e = ohlcvMap[ts]
+            if (row[openIdx] != null) {
+              if (e.open == null) {
+                e.open = row[openIdx]
+                e.high = row[highIdx]
+                e.low = row[lowIdx]
+                e.close = row[closeIdx]
+              } else {
+                e.high = Math.max(e.high, row[highIdx])
+                e.low = Math.min(e.low, row[lowIdx])
+                e.close = row[closeIdx]
+              }
+            }
+            e.vol_buy += row[vbuyIdx] || 0
+            e.vol_sell += row[vsellIdx] || 0
+            e.count_buy += row[cbuyIdx] || 0
+            e.count_sell += row[csellIdx] || 0
+          }
         }
       }
     }
@@ -1025,27 +1046,27 @@ class InfluxStorage {
 
         if (results && results.results && results.results[0] &&
             results.results[0].series && results.results[0].series[0]) {
-          const series = results.results[0].series[0]
-          const cols = series.columns
-          const timeIdx = cols.indexOf('time')
-          const vbuyIdx = cols.indexOf('vbuy')
-          const vsellIdx = cols.indexOf('vsell')
+          for (const series of results.results[0].series) {
+            const cols = series.columns
+            const timeIdx = cols.indexOf('time')
+            const vbuyIdx = cols.indexOf('vbuy')
+            const vsellIdx = cols.indexOf('vsell')
 
-          for (const row of series.values) {
-            const ts = typeof row[timeIdx] === 'string'
-              ? new Date(row[timeIdx]).getTime()
-              : Math.floor(row[timeIdx])
+            for (const row of series.values) {
+              const ts = typeof row[timeIdx] === 'string'
+                ? new Date(row[timeIdx]).getTime()
+                : Math.floor(row[timeIdx])
 
-            if (ts < windowStart) continue
+              if (ts < windowStart) continue
 
-            const bucketsAgo = Math.floor((ring.headTime - ts) / this.CVD_BUCKET_MS)
-            if (bucketsAgo < 0 || bucketsAgo >= this.CVD_BUCKET_COUNT) continue
+              const bucketsAgo = Math.floor((ring.headTime - ts) / this.CVD_BUCKET_MS)
+              if (bucketsAgo < 0 || bucketsAgo >= this.CVD_BUCKET_COUNT) continue
 
-            // head is index 0, older buckets wrap backwards
-            const idx = ((ring.head - bucketsAgo) % this.CVD_BUCKET_COUNT + this.CVD_BUCKET_COUNT) % this.CVD_BUCKET_COUNT
-            const delta = (row[vbuyIdx] || 0) - (row[vsellIdx] || 0)
-            ring.buckets[idx] += delta
-            ring.total += delta
+              const idx = ((ring.head - bucketsAgo) % this.CVD_BUCKET_COUNT + this.CVD_BUCKET_COUNT) % this.CVD_BUCKET_COUNT
+              const delta = (row[vbuyIdx] || 0) - (row[vsellIdx] || 0)
+              ring.buckets[idx] += delta
+              ring.total += delta
+            }
           }
         }
 
