@@ -702,9 +702,69 @@ These endpoints are used by AGGREGATED tickers for trade data and footprint.
 
 No query parameters. No authentication beyond existing origin check.
 
-**Frontend handling:** Poll every 15 seconds for AGGREGATED tickers alongside the OI poll. Display `cvd_24h` directly in the 12H CVD row (row 5) of bar stats for the current candle. For historical candles' CVD cells, use per-candle delta sums from trade data.
+**Frontend handling:** Superseded by `/bar_stats/{symbol}` for live candle polling. This endpoint remains available for standalone CVD-only queries.
 
-**⚠️ DATA SOURCE:** Computed from an in-memory accumulator updated on every trade batch (~10s). Reconciled against the bar cascade every 5 minutes. Starts empty on restart and seeds from InfluxDB bar cascade on first reconciliation.
+**⚠️ DATA SOURCE:** Computed from an in-memory ring buffer (8640 × 10s buckets) updated on every trade batch (~10s). Reconciled against the bar cascade every 5 minutes. Starts empty on restart and seeds from InfluxDB bar cascade on first reconciliation.
+
+---
+
+### GET `/aggr/bar_stats/{symbol}?timeframe=60000`
+
+**Purpose:** Server-authoritative current candle volume, delta, and CVD. Replaces WebSocket-based live bar stats accumulation in the frontend, which was lossy due to network transport and client-side processing delays.
+**Poll interval:** 250-500ms from the frontend.
+**Cache:** None — pure in-memory read on every request.
+
+**Parameters:**
+
+| Parameter | Type | Location | Required | Description |
+|-----------|------|----------|----------|-------------|
+| `symbol` | string | URL path | Yes | `BTC`, `ETH`, or `SOL` (case-insensitive) |
+| `timeframe` | int | Query string | No | Candle width in ms. Default `60000` (1m). Minimum `60000`. |
+
+**Response (200):**
+```json
+{
+  "symbol": "BTC",
+  "candle_ts": 1708699800000,
+  "timeframe": 300000,
+  "vol_buy": 14523050.50,
+  "vol_sell": 13287025.25,
+  "delta": 1236025.25,
+  "cvd_24h": 393015646.16,
+  "cvd_24h_ts": 1708700000000
+}
+```
+
+| Field | Type | Unit | Notes |
+|-------|------|------|-------|
+| `symbol` | string | — | Echoed back, uppercased |
+| `candle_ts` | int | **Milliseconds** | Opening timestamp of the current candle at the requested timeframe |
+| `timeframe` | int | **Milliseconds** | Echoed back timeframe |
+| `vol_buy` | float | **USD** | Buy volume accumulated since `candle_ts`, across all 4 exchanges |
+| `vol_sell` | float | **USD** | Sell volume accumulated since `candle_ts`, across all 4 exchanges |
+| `delta` | float | **USD** | `vol_buy - vol_sell` |
+| `cvd_24h` | float | **USD** | Rolling 24h CVD from the ring buffer (same value as `/cvd/{symbol}`) |
+| `cvd_24h_ts` | int | **Milliseconds** | Timestamp of CVD computation |
+
+**Error responses:**
+- `400` — Invalid symbol or timeframe < 60000
+- `503` — No data yet (server just started, warming up)
+- `500` — Internal error
+
+**Examples:**
+```
+GET /bar_stats/btc                    → 1m candle stats
+GET /bar_stats/BTC?timeframe=300000   → 5m candle stats
+GET /bar_stats/ETH?timeframe=900000   → 15m candle stats
+```
+
+**How timeframe works:** The server maintains a 60-entry ring of 1-minute buckets per symbol, updated on every trade in real-time. When a timeframe is requested, the server computes the current candle's time window (e.g. 5m = `floor(now / 300000) * 300000`) and sums all 1-minute buckets within that window. Any timeframe that is a multiple of 1 minute works, up to 60 minutes (limited by ring depth). For timeframes > 60m, only the most recent 60 minutes of the candle will be included.
+
+**Frontend handling:** Poll every 250-500ms. Use `vol_buy`, `vol_sell`, `delta` as the authoritative values for the live candle's bar stats. Use `cvd_24h` for the 24H CVD display. On candle close (when `candle_ts` changes), the previous candle's final values are available from the next `/footprint` fetch. The aggr-WS is still used for live OHLC and footprint level rendering — only volume/delta/CVD stats come from this endpoint.
+
+**⚠️ DATA SOURCE:** Fed directly by `dispatchRawTrades` on every exchange WebSocket message (same trade flow that feeds InfluxDB and the WS broadcast). Not batched — every trade is accumulated immediately. Starts empty on restart and fills from the first trade received.
+
+**⚠️ TIMEFRAME > 60m:** The ring buffer stores 60 one-minute buckets. For timeframes longer than 60 minutes (e.g. 4h candles), the endpoint returns volume from only the most recent 60 minutes of the candle, not the full candle. Use `/footprint` for full historical candle data.
 
 ---
 
@@ -728,6 +788,7 @@ Both the backend and aggr-server have data that **starts empty on restart** and 
 | Liq events | Backend `_liq_events` deque | 12,000 events | Event-driven | No liq backfill for candles older than oldest event in buffer |
 | Raw trades | Aggr-server InfluxDB `aggr_raw` | 12 hours | Tick-level | No footprint data beyond 12h |
 | CVD accumulator | Aggr-server in-memory | 24 hours | ~10s updates | `cvd_24h` is 0 on restart until first bar cascade reconciliation (~5min) |
+| Bar stats ring | Aggr-server in-memory | 60 minutes | Per-trade | `/bar_stats` returns zeros on restart until first trade. Timeframes >60m show partial data. |
 | Liq heatmap history | Backend binary buffer | ~720 frames | 1 per minute | ~12 hours of heatmap overlay |
 | OB heatmap history | Backend binary buffer | ~1440 frames | 1 per 30s | ~12 hours of OB overlay |
 
