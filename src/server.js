@@ -44,6 +44,28 @@ class Server extends EventEmitter {
 
     this.BANNED_IPS = []
 
+    /**
+     * Per-symbol 1-minute bar stats ring buffer.
+     * 60 entries per symbol = 1 hour of 1-minute buckets.
+     * Fed in real-time by dispatchRawTrades, summed on read for any timeframe.
+     *
+     * barStats[symbol] = {
+     *   ring: Array<{ts, vol_buy, vol_sell}>,  // 60 slots
+     *   head: number,                           // current write index
+     *   headTs: number,                         // floored 1m timestamp of head bucket
+     * }
+     */
+    this.BAR_STATS_BUCKET_MS = 60000 // 1 minute per bucket
+    this.BAR_STATS_RING_SIZE = 60    // 60 minutes of history
+    this.barStats = {}
+    for (const sym of ['BTC', 'ETH', 'SOL']) {
+      const ring = new Array(this.BAR_STATS_RING_SIZE)
+      for (let i = 0; i < this.BAR_STATS_RING_SIZE; i++) {
+        ring[i] = { ts: 0, vol_buy: 0, vol_sell: 0 }
+      }
+      this.barStats[sym] = { ring, head: 0, headTs: 0 }
+    }
+
     if (config.collect) {
       console.log('\n[server] collect is enabled')
       console.log(`\tconnect to -> ${this.exchanges.map(a => a.id).join(', ')}`)
@@ -653,6 +675,78 @@ class Server extends EventEmitter {
         })
     })
 
+    // Live bar stats endpoint — server-authoritative current candle volume/delta
+    app.get('/bar_stats/:symbol', (req, res) => {
+      const symbol = (req.params.symbol || '').toUpperCase()
+
+      if (!['BTC', 'ETH', 'SOL'].includes(symbol)) {
+        return res.status(400).json({
+          error: 'invalid symbol, use BTC/ETH/SOL'
+        })
+      }
+
+      const timeframe = parseInt(req.query.timeframe) || 60000
+      if (timeframe < 60000) {
+        return res.status(400).json({
+          error: 'minimum timeframe is 60000 (1 minute)'
+        })
+      }
+
+      const bs = this.barStats[symbol]
+      if (!bs || bs.headTs === 0) {
+        return res.status(503).json({
+          error: 'no data yet, warming up'
+        })
+      }
+
+      // Compute the current candle's opening timestamp at the requested timeframe
+      const now = Date.now()
+      const candleTs = Math.floor(now / timeframe) * timeframe
+
+      // Sum all 1-minute buckets that fall within this candle's window
+      let volBuy = 0
+      let volSell = 0
+      const candleEnd = candleTs + timeframe
+
+      for (let i = 0; i < this.BAR_STATS_RING_SIZE; i++) {
+        const idx = ((bs.head - i) % this.BAR_STATS_RING_SIZE + this.BAR_STATS_RING_SIZE) % this.BAR_STATS_RING_SIZE
+        const bucket = bs.ring[idx]
+        if (bucket.ts === 0) continue
+        if (bucket.ts < candleTs) break  // past the candle start, stop
+        if (bucket.ts >= candleEnd) continue // shouldn't happen, but guard
+        volBuy += bucket.vol_buy
+        volSell += bucket.vol_sell
+      }
+
+      const response = {
+        symbol,
+        candle_ts: candleTs,
+        timeframe,
+        vol_buy: +volBuy.toFixed(2),
+        vol_sell: +volSell.toFixed(2),
+        delta: +(volBuy - volSell).toFixed(2)
+      }
+
+      // Include cvd_24h if storage supports it
+      const storage = this.storages
+        ? this.storages.find(s => s.format === 'point')
+        : null
+
+      if (storage && typeof storage.fetchCVD24h === 'function') {
+        storage.fetchCVD24h(symbol)
+          .then(cvd => {
+            response.cvd_24h = cvd.cvd_24h
+            response.cvd_24h_ts = cvd.cvd_24h_ts
+            return res.status(200).json(response)
+          })
+          .catch(() => {
+            return res.status(200).json(response)
+          })
+      } else {
+        return res.status(200).json(response)
+      }
+    })
+
     app.use(function (err, req, res, _next) {
       if (err) {
         console.error(err)
@@ -1053,6 +1147,51 @@ class Server extends EventEmitter {
             // client gone, will be cleaned up on close
           }
         }
+      }
+    }
+
+    // Accumulate into bar stats ring buffer (real-time, every trade)
+    for (let i = 0; i < trades.length; i++) {
+      const trade = trades[i]
+      if (!trade.size || trade.liquidation) continue
+
+      const identifier = trade.exchange + ':' + trade.pair
+      const symbol = this.RAW_TRADE_MARKETS[identifier]
+      if (!symbol) continue
+
+      const bs = this.barStats[symbol]
+      const tradeMinute = Math.floor(trade.timestamp / this.BAR_STATS_BUCKET_MS) * this.BAR_STATS_BUCKET_MS
+
+      // Advance ring if we've moved to a new minute
+      if (bs.headTs === 0) {
+        bs.headTs = tradeMinute
+        bs.ring[bs.head].ts = tradeMinute
+      } else if (tradeMinute > bs.headTs) {
+        const minutesToAdvance = Math.min(
+          Math.floor((tradeMinute - bs.headTs) / this.BAR_STATS_BUCKET_MS),
+          this.BAR_STATS_RING_SIZE
+        )
+        for (let j = 1; j <= minutesToAdvance; j++) {
+          const idx = (bs.head + j) % this.BAR_STATS_RING_SIZE
+          bs.ring[idx].ts = 0
+          bs.ring[idx].vol_buy = 0
+          bs.ring[idx].vol_sell = 0
+        }
+        bs.head = (bs.head + minutesToAdvance) % this.BAR_STATS_RING_SIZE
+        bs.headTs = tradeMinute
+        bs.ring[bs.head].ts = tradeMinute
+      }
+
+      // Find the correct bucket for this trade (may be slightly behind head)
+      const minutesAgo = Math.floor((bs.headTs - tradeMinute) / this.BAR_STATS_BUCKET_MS)
+      if (minutesAgo < 0 || minutesAgo >= this.BAR_STATS_RING_SIZE) continue
+
+      const idx = ((bs.head - minutesAgo) % this.BAR_STATS_RING_SIZE + this.BAR_STATS_RING_SIZE) % this.BAR_STATS_RING_SIZE
+      const usdVol = trade.price * trade.size
+      if (trade.side === 'buy') {
+        bs.ring[idx].vol_buy += usdVol
+      } else {
+        bs.ring[idx].vol_sell += usdVol
       }
     }
   }
