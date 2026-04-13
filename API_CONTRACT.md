@@ -778,6 +778,74 @@ GET /bar_stats/ETH?timeframe=900000   → 15m candle stats
 
 ---
 
+### GET `/aggr/metrics`
+
+**Purpose:** Prometheus text exposition format metrics for monitoring aggr-server health and throughput. Scraped by Prometheus every 15 seconds from the backend monitoring server.
+**Cache:** None — rendered on every request from in-memory state.
+**Content-Type:** `text/plain; version=0.0.4; charset=utf-8`
+**CORS:** Bypasses the origin check — always accessible for monitoring scrapers.
+
+**Metrics exposed:**
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `aggr_uptime_seconds` | gauge | — | Process uptime since startup |
+| `aggr_memory_rss_bytes` | gauge | — | Resident set size of the Node.js process |
+| `aggr_exchange_connected` | gauge | `exchange`, `symbol` | 1 if the exchange:pair has an active API connection, 0 otherwise |
+| `aggr_exchange_last_message_age_seconds` | gauge | `exchange`, `symbol` | Seconds since last trade received on this exchange:pair (-1 if never) |
+| `aggr_trades_total` | counter | `symbol` | Total trades received per BTC/ETH/SOL since process start |
+| `aggr_trades_per_second` | gauge | `symbol` | Rolling 60-second average trades/sec per symbol |
+| `aggr_influx_write_duration_ms` | gauge | — | Duration of the most recent InfluxDB writePoints call |
+| `aggr_influx_resample_duration_ms` | gauge | — | Duration of the most recent bar cascade resample |
+| `aggr_bar_stats_vol_buy` | gauge | `symbol` | Current 1-minute candle vol_buy in USD |
+| `aggr_bar_stats_vol_sell` | gauge | `symbol` | Current 1-minute candle vol_sell in USD |
+| `aggr_bar_stats_candle_ts` | gauge | `symbol` | Current 1-minute candle opening timestamp (ms) |
+| `aggr_cvd_24h` | gauge | `symbol` | Current rolling 24-hour CVD in USD |
+| `aggr_cvd_ring_entries` | gauge | `symbol` | Number of non-zero entries in the CVD ring buffer (out of 8640) |
+| `aggr_ws_clients_total` | gauge | — | Currently connected WebSocket clients |
+| `aggr_ws_broadcast_total` | counter | `symbol` | Total WebSocket broadcasts sent per symbol |
+| `aggr_api_requests_total` | counter | `endpoint` | Total HTTP API requests per normalized endpoint |
+| `aggr_api_request_duration_seconds` | summary | `endpoint`, `quantile` | p50/p90/p99 request duration over last 1000 requests per endpoint |
+
+**Endpoint label normalization:** API request labels collapse path parameters to the route prefix to keep cardinality bounded. For example, `/footprint/BTC/123/456/60000` and `/footprint/ETH/789/1000/300000` both report as `endpoint="/footprint"`. The first path segment becomes the label.
+
+**Example output:**
+```
+# HELP aggr_uptime_seconds Process uptime in seconds
+# TYPE aggr_uptime_seconds gauge
+aggr_uptime_seconds 86400
+# HELP aggr_memory_rss_bytes Resident set size of the Node.js process in bytes
+# TYPE aggr_memory_rss_bytes gauge
+aggr_memory_rss_bytes 234881024
+# HELP aggr_exchange_connected 1 if the exchange:pair has an active API connection, 0 otherwise
+# TYPE aggr_exchange_connected gauge
+aggr_exchange_connected{exchange="BINANCE_FUTURES",symbol="btcusdt"} 1
+aggr_exchange_connected{exchange="BYBIT",symbol="BTCUSDT"} 1
+aggr_exchange_connected{exchange="OKEX",symbol="BTC-USDT-SWAP"} 1
+aggr_exchange_connected{exchange="HYPERLIQUID",symbol="BTC"} 1
+# HELP aggr_trades_total Total number of trades received per symbol since process start
+# TYPE aggr_trades_total counter
+aggr_trades_total{symbol="BTC"} 1523847
+aggr_trades_total{symbol="ETH"} 982341
+aggr_trades_total{symbol="SOL"} 451029
+# HELP aggr_cvd_24h Current rolling 24-hour cumulative volume delta in USD
+# TYPE aggr_cvd_24h gauge
+aggr_cvd_24h{symbol="BTC"} -119061244.13
+aggr_cvd_24h{symbol="ETH"} 355967970.57
+aggr_cvd_24h{symbol="SOL"} -57146714.68
+# HELP aggr_api_request_duration_seconds API request duration in seconds, p50/p90/p99 from last 1000 requests per endpoint
+# TYPE aggr_api_request_duration_seconds summary
+aggr_api_request_duration_seconds{endpoint="/bar_stats",quantile="0.5"} 0.002
+aggr_api_request_duration_seconds{endpoint="/bar_stats",quantile="0.9"} 0.005
+aggr_api_request_duration_seconds{endpoint="/bar_stats",quantile="0.99"} 0.012
+```
+
+**⚠️ EXCHANGE LABEL VALUES:** The `exchange` label uses the raw aggr-server exchange ID (e.g. `BINANCE_FUTURES`, `BYBIT`, `OKEX`, `HYPERLIQUID`), not the simplified `binance`/`bybit`/`okx` form used by other backend endpoints. The `symbol` label is the raw pair string (e.g. `btcusdt`, `BTCUSDT`, `BTC-USDT-SWAP`, `BTC`), not the short symbol.
+
+**⚠️ TRADES_PER_SECOND WARMUP:** The rolling 60s average is computed from a buckets array that starts empty. For the first 60 seconds after process start, the rate may be artificially low. After 60 seconds, it stabilizes.
+
+---
+
 ## In-Memory Buffer Limitations
 
 Both the backend and aggr-server have data that **starts empty on restart** and accumulates over time:
@@ -789,6 +857,7 @@ Both the backend and aggr-server have data that **starts empty on restart** and 
 | Raw trades | Aggr-server InfluxDB `aggr_raw` | 12 hours | Tick-level | No footprint data beyond 12h |
 | CVD accumulator | Aggr-server in-memory | 24 hours | ~10s updates | `cvd_24h` is 0 on restart until first bar cascade reconciliation (~5min) |
 | Bar stats ring | Aggr-server in-memory | 60 minutes | Per-trade | `/bar_stats` returns zeros on restart until first trade. Timeframes >60m show partial data. |
+| Metrics counters | Aggr-server in-memory | Process lifetime | Per-event | All `aggr_*_total` counters reset on restart. API duration arrays hold last 1000 per endpoint. |
 | Liq heatmap history | Backend binary buffer | ~720 frames | 1 per minute | ~12 hours of heatmap overlay |
 | OB heatmap history | Backend binary buffer | ~1440 frames | 1 per 30s | ~12 hours of OB overlay |
 
