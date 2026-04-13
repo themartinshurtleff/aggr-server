@@ -70,6 +70,10 @@ class InfluxStorage {
     this.CVD_SYMBOLS = ['BTC', 'ETH', 'SOL']
     this.CVD_RECONCILE_INTERVAL = 5 * 60 * 1000 // reconcile every 5 minutes
 
+    // Metrics state — exposed via /metrics endpoint
+    this.lastWriteDurationMs = 0
+    this.lastResampleDurationMs = 0
+
     for (const sym of this.CVD_SYMBOLS) {
       this.cvdRing[sym] = {
         buckets: new Float64Array(this.CVD_BUCKET_COUNT),
@@ -1220,8 +1224,10 @@ class InfluxStorage {
     const from = points[0].timestamp
     const to = points[points.length - 1].timestamp
 
+    const writeStart = Date.now()
     try {
       await this.influx.writePoints(points, options)
+      this.lastWriteDurationMs = Date.now() - writeStart
 
       if (attempt > 0) {
         console.log(
@@ -1364,6 +1370,7 @@ class InfluxStorage {
     now = Date.now()
 
     const elapsedOp = now - before
+    this.lastResampleDurationMs = elapsedOp
 
     console.log(
       `[storage/influx/resample] done resampling ${parseInt(

@@ -66,6 +66,21 @@ class Server extends EventEmitter {
       this.barStats[sym] = { ring, head: 0, headTs: 0 }
     }
 
+    /**
+     * Prometheus metrics state.
+     * Counters are integers, gauges are read live from existing state where possible.
+     * Per-endpoint duration arrays are bounded ring buffers (last 1000 requests).
+     */
+    this.startedAt = Date.now()
+    this.metrics = {
+      tradesTotal: { BTC: 0, ETH: 0, SOL: 0 },
+      // Rolling 60-second trade counts per symbol — array of {ts, count} pairs
+      tradesPerSecondBuckets: { BTC: [], ETH: [], SOL: [] },
+      wsBroadcastsTotal: { BTC: 0, ETH: 0, SOL: 0 },
+      apiRequestsTotal: {},   // { endpoint: count }
+      apiRequestDurations: {} // { endpoint: number[] (last 1000 ms) }
+    }
+
     if (config.collect) {
       console.log('\n[server] collect is enabled')
       console.log(`\tconnect to -> ${this.exchanges.map(a => a.id).join(', ')}`)
@@ -293,6 +308,29 @@ class Server extends EventEmitter {
 
     app.use(cors())
 
+    // Metrics middleware — track request counts and durations per normalized endpoint.
+    // Normalizes path to the route prefix (e.g. /footprint/BTC/1/2/3 -> /footprint)
+    // to keep label cardinality bounded.
+    app.use((req, res, next) => {
+      const start = Date.now()
+      const path = req.path || req.url.split('?')[0]
+      const segments = path.split('/').filter(Boolean)
+      const endpoint = segments.length ? '/' + segments[0] : '/'
+
+      res.on('finish', () => {
+        const duration = Date.now() - start
+        this.metrics.apiRequestsTotal[endpoint] =
+          (this.metrics.apiRequestsTotal[endpoint] || 0) + 1
+        if (!this.metrics.apiRequestDurations[endpoint]) {
+          this.metrics.apiRequestDurations[endpoint] = []
+        }
+        const arr = this.metrics.apiRequestDurations[endpoint]
+        arr.push(duration)
+        if (arr.length > 1000) arr.shift()
+      })
+      next()
+    })
+
     if (config.enableRateLimit) {
       const limiter = rateLimit({
         windowMs: config.rateLimitTimeWindow,
@@ -311,6 +349,13 @@ class Server extends EventEmitter {
       // apply to all requests
       app.use(limiter)
     }
+
+    // Prometheus metrics endpoint — registered BEFORE the origin check so
+    // backend scrapes always succeed regardless of CORS config.
+    app.get('/metrics', (req, res) => {
+      res.set('Content-Type', 'text/plain; version=0.0.4; charset=utf-8')
+      res.send(this.renderMetrics())
+    })
 
     app.all('/*', (req, res, next) => {
       var user = req.headers['x-forwarded-for'] || req.connection.remoteAddress
@@ -817,6 +862,173 @@ class Server extends EventEmitter {
     console.log(`[server] websocket broadcast available at ws://localhost:${config.port}/ws`)
   }
 
+  /**
+   * Render Prometheus text exposition format from current metrics state.
+   * Format spec: https://prometheus.io/docs/instrumenting/exposition_formats/
+   * @returns {string}
+   */
+  renderMetrics() {
+    const lines = []
+    const now = Date.now()
+    const symbols = ['BTC', 'ETH', 'SOL']
+
+    const escapeLabel = (v) => String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n')
+
+    const help = (name, text) => lines.push(`# HELP ${name} ${text}`)
+    const type = (name, t) => lines.push(`# TYPE ${name} ${t}`)
+    const metric = (name, value, labels) => {
+      let labelStr = ''
+      if (labels) {
+        const parts = []
+        for (const k in labels) {
+          parts.push(`${k}="${escapeLabel(labels[k])}"`)
+        }
+        labelStr = '{' + parts.join(',') + '}'
+      }
+      // Format numbers — integers stay as integers, floats get full precision
+      const v = Number.isFinite(value) ? value : 0
+      lines.push(`${name}${labelStr} ${v}`)
+    }
+
+    // --- Process health ---
+    help('aggr_uptime_seconds', 'Process uptime in seconds')
+    type('aggr_uptime_seconds', 'gauge')
+    metric('aggr_uptime_seconds', Math.floor((now - this.startedAt) / 1000))
+
+    help('aggr_memory_rss_bytes', 'Resident set size of the Node.js process in bytes')
+    type('aggr_memory_rss_bytes', 'gauge')
+    metric('aggr_memory_rss_bytes', process.memoryUsage().rss)
+
+    // --- Exchange connectivity ---
+    help('aggr_exchange_connected', '1 if the exchange:pair has an active API connection, 0 otherwise')
+    type('aggr_exchange_connected', 'gauge')
+    help('aggr_exchange_last_message_age_seconds', 'Seconds since the last trade message was received on this exchange:pair')
+    type('aggr_exchange_last_message_age_seconds', 'gauge')
+
+    for (const id in connections) {
+      const conn = connections[id]
+      const labels = { exchange: conn.exchange, symbol: conn.pair }
+      metric('aggr_exchange_connected', conn.apiId ? 1 : 0, labels)
+      const ageSec = conn.timestamp ? Math.floor((now - conn.timestamp) / 1000) : -1
+      metric('aggr_exchange_last_message_age_seconds', ageSec, labels)
+    }
+
+    // --- Trade throughput ---
+    help('aggr_trades_total', 'Total number of trades received per symbol since process start')
+    type('aggr_trades_total', 'counter')
+    for (const sym of symbols) {
+      metric('aggr_trades_total', this.metrics.tradesTotal[sym], { symbol: sym })
+    }
+
+    help('aggr_trades_per_second', 'Trades per second per symbol (rolling 60s average)')
+    type('aggr_trades_per_second', 'gauge')
+    const nowSec = Math.floor(now / 1000)
+    const cutoff = nowSec - 60
+    for (const sym of symbols) {
+      const buckets = this.metrics.tradesPerSecondBuckets[sym]
+      let sum = 0
+      let span = 0
+      for (const b of buckets) {
+        if (b.ts < cutoff) continue
+        sum += b.count
+        span = Math.max(span, nowSec - b.ts + 1)
+      }
+      const rate = span > 0 ? sum / Math.min(span, 60) : 0
+      metric('aggr_trades_per_second', +rate.toFixed(2), { symbol: sym })
+    }
+
+    // --- InfluxDB health ---
+    help('aggr_influx_write_duration_ms', 'Duration of the most recent InfluxDB writePoints call in ms')
+    type('aggr_influx_write_duration_ms', 'gauge')
+    help('aggr_influx_resample_duration_ms', 'Duration of the most recent bar cascade resample in ms')
+    type('aggr_influx_resample_duration_ms', 'gauge')
+
+    const influxStorage = this.storages
+      ? this.storages.find(s => s.format === 'point')
+      : null
+
+    if (influxStorage) {
+      metric('aggr_influx_write_duration_ms', influxStorage.lastWriteDurationMs || 0)
+      metric('aggr_influx_resample_duration_ms', influxStorage.lastResampleDurationMs || 0)
+    } else {
+      metric('aggr_influx_write_duration_ms', 0)
+      metric('aggr_influx_resample_duration_ms', 0)
+    }
+
+    // --- Bar stats accumulator ---
+    help('aggr_bar_stats_vol_buy', 'Current 1-minute candle vol_buy in USD')
+    type('aggr_bar_stats_vol_buy', 'gauge')
+    help('aggr_bar_stats_vol_sell', 'Current 1-minute candle vol_sell in USD')
+    type('aggr_bar_stats_vol_sell', 'gauge')
+    help('aggr_bar_stats_candle_ts', 'Current 1-minute candle opening timestamp in milliseconds')
+    type('aggr_bar_stats_candle_ts', 'gauge')
+
+    for (const sym of symbols) {
+      const bs = this.barStats[sym]
+      const headBucket = bs.ring[bs.head]
+      metric('aggr_bar_stats_vol_buy', headBucket.vol_buy || 0, { symbol: sym })
+      metric('aggr_bar_stats_vol_sell', headBucket.vol_sell || 0, { symbol: sym })
+      metric('aggr_bar_stats_candle_ts', bs.headTs || 0, { symbol: sym })
+    }
+
+    // --- CVD ring buffer ---
+    help('aggr_cvd_24h', 'Current rolling 24-hour cumulative volume delta in USD')
+    type('aggr_cvd_24h', 'gauge')
+    help('aggr_cvd_ring_entries', 'Number of non-zero entries in the CVD ring buffer (out of 8640)')
+    type('aggr_cvd_ring_entries', 'gauge')
+
+    if (influxStorage && influxStorage.cvdRing) {
+      for (const sym of symbols) {
+        const ring = influxStorage.cvdRing[sym]
+        if (!ring) continue
+        metric('aggr_cvd_24h', ring.seeded ? +ring.total.toFixed(2) : 0, { symbol: sym })
+        let filled = 0
+        for (let i = 0; i < ring.buckets.length; i++) {
+          if (ring.buckets[i] !== 0) filled++
+        }
+        metric('aggr_cvd_ring_entries', filled, { symbol: sym })
+      }
+    }
+
+    // --- WebSocket broadcast ---
+    help('aggr_ws_clients_total', 'Number of currently connected WebSocket clients')
+    type('aggr_ws_clients_total', 'gauge')
+    metric('aggr_ws_clients_total', this.wsClients ? this.wsClients.size : 0)
+
+    help('aggr_ws_broadcast_total', 'Total WebSocket broadcasts sent per symbol since process start')
+    type('aggr_ws_broadcast_total', 'counter')
+    for (const sym of symbols) {
+      metric('aggr_ws_broadcast_total', this.metrics.wsBroadcastsTotal[sym], { symbol: sym })
+    }
+
+    // --- API request tracking ---
+    help('aggr_api_requests_total', 'Total HTTP API requests received per endpoint')
+    type('aggr_api_requests_total', 'counter')
+    for (const endpoint in this.metrics.apiRequestsTotal) {
+      metric('aggr_api_requests_total', this.metrics.apiRequestsTotal[endpoint], { endpoint })
+    }
+
+    help('aggr_api_request_duration_seconds', 'API request duration in seconds, p50/p90/p99 from last 1000 requests per endpoint')
+    type('aggr_api_request_duration_seconds', 'summary')
+
+    const quantile = (sortedMs, q) => {
+      if (!sortedMs.length) return 0
+      const idx = Math.min(sortedMs.length - 1, Math.floor(sortedMs.length * q))
+      return sortedMs[idx] / 1000
+    }
+
+    for (const endpoint in this.metrics.apiRequestDurations) {
+      const arr = this.metrics.apiRequestDurations[endpoint]
+      if (!arr.length) continue
+      const sorted = arr.slice().sort((a, b) => a - b)
+      metric('aggr_api_request_duration_seconds', +quantile(sorted, 0.5).toFixed(6), { endpoint, quantile: '0.5' })
+      metric('aggr_api_request_duration_seconds', +quantile(sorted, 0.9).toFixed(6), { endpoint, quantile: '0.9' })
+      metric('aggr_api_request_duration_seconds', +quantile(sorted, 0.99).toFixed(6), { endpoint, quantile: '0.99' })
+    }
+
+    return lines.join('\n') + '\n'
+  }
+
   monitorUsage() {
     const tick = this.globalUsage.tick
     this.globalUsage.points.push(tick)
@@ -1096,6 +1308,8 @@ class Server extends EventEmitter {
   dispatchRawTrades(trades) {
     // Batch WS broadcasts per symbol
     const wsBatches = {}
+    // Per-symbol trade counts for this batch (for metrics)
+    const symbolTradeCounts = {}
 
     for (let i = 0; i < trades.length; i++) {
       const trade = trades[i]
@@ -1123,11 +1337,31 @@ class Server extends EventEmitter {
             trade.side === 'buy' ? 0 : 1,
             trade.exchange
           ])
+          symbolTradeCounts[symbol] = (symbolTradeCounts[symbol] || 0) + 1
         }
       }
       // save trade
       if (this.storages) {
         this.chunk.push(trade)
+      }
+    }
+
+    // Update trade throughput metrics (per-symbol totals + rolling 60s buckets)
+    const nowSec = Math.floor(Date.now() / 1000)
+    for (const sym in symbolTradeCounts) {
+      this.metrics.tradesTotal[sym] += symbolTradeCounts[sym]
+
+      const buckets = this.metrics.tradesPerSecondBuckets[sym]
+      const last = buckets[buckets.length - 1]
+      if (last && last.ts === nowSec) {
+        last.count += symbolTradeCounts[sym]
+      } else {
+        buckets.push({ ts: nowSec, count: symbolTradeCounts[sym] })
+      }
+      // Trim buckets older than 60 seconds
+      const cutoff = nowSec - 60
+      while (buckets.length && buckets[0].ts < cutoff) {
+        buckets.shift()
       }
     }
 
@@ -1143,6 +1377,7 @@ class Server extends EventEmitter {
           }
           try {
             ws.send(serialized[sym])
+            this.metrics.wsBroadcastsTotal[sym]++
           } catch (_e) {
             // client gone, will be cleaned up on close
           }
