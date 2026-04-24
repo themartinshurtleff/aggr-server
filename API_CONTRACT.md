@@ -3,7 +3,22 @@
 **Single source of truth for all data exchanged between the Python backend and the Rust frontend.**
 This file must live in both repos. Any change to an endpoint's response format, units, or behavior MUST be reflected here FIRST, then in both CLAUDE.md files.
 
-Last verified against backend code: April 1, 2026
+**Last verified against backend code:** April 23, 2026
+**Backend version:** 3.0.0 (embedded API only — `liq_api.py` standalone server is orphaned)
+
+---
+
+## Infrastructure
+
+**All backend services now run on a single Hetzner CCX23 box in Nuremberg.** The DigitalOcean Frankfurt droplet was decommissioned on April 22, 2026 after Binance IP-banned its outbound traffic; aggr-server and nginx were migrated to the Hetzner box in an emergency same-day migration.
+
+- `api.tradenet.org:8899` — Python backend (FastAPI embedded in `full_metrics_viewer.py`)
+- `proxy.tradenet.org` — nginx reverse proxy serving Binance passthroughs (`/spot`, `/futures`, `/inverse`, `/ws*`), aggr-server (`/aggr/*`), and Velopack releases (`/releases/`)
+- Both domains resolve to the same Hetzner IP, distinguished by nginx `server_name` blocks
+
+**Binance REST is now DIRECT from backend.** As of April 16, 2026 (PR #47), Hetzner was unbanned by Binance. `BINANCE_FAPI_BASE` = `https://fapi.binance.com` in `oi_poller.py`, `rest_pollers.py`, `ob_heatmap.py`, and `full_metrics_viewer.py`. WebSocket streams always went direct.
+
+See `TRADENET_SERVER_INFRASTRUCTURE.md` for full infrastructure details.
 
 ---
 
@@ -11,7 +26,7 @@ Last verified against backend code: April 1, 2026
 
 | Valid Symbols | `BTC`, `ETH`, `SOL` |
 |---------------|----------------------|
-| Backend accepts | Both short (`BTC`) and full (`BTCUSDT`) — `_validate_symbol()` strips USDT suffix, uppercases |
+| Backend accepts | Both short (`BTC`) and full (`BTCUSDT`) — `_validate_symbol()` strips USDT suffix, uppercases. Empty or >10 char symbols rejected with 400. |
 | Frontend sends | Short symbols (`BTC`) for AGGREGATED tickers; full symbols (`BTCUSDT`) for single-exchange tickers |
 | Invalid symbol | HTTP 400 with `{"detail": "Invalid symbol 'XRP'. Valid symbols: BTC, ETH, SOL"}` |
 | Warming up | HTTP 503 with `{"detail": "Data for ETH is warming up, please try again shortly."}` — transient, retry after 5-10s |
@@ -23,9 +38,27 @@ Last verified against backend code: April 1, 2026
 **Production:** `http://api.tradenet.org:8899`
 **Frontend constant:** `BACKEND_API_BASE` in `exchange/src/lib.rs`
 
-The backend uses **clean primary paths** (e.g., `/oi`, `/liq_events`). Old `/v1/`, `/v2/`, `/v3/` paths are kept as aliases. Both work identically. The frontend currently uses a mix — new code should prefer clean paths.
+The backend uses **clean primary paths** (e.g., `/oi`, `/liq_events`). Old `/v1/`, `/v2/`, `/v3/` paths remain as backwards-compatible aliases. Both work identically. The frontend currently uses a mix — new code should prefer clean paths.
 
-**⚠️ KNOWN INCONSISTENCY:** The `/oi` endpoint has **NO** `/v2/oi` alias. The frontend previously hit `/v2/oi` which returned 404. This was fixed (bug fix #12 in the roadmap). Always use `/oi` directly.
+**⚠️ KNOWN INCONSISTENCY:** The `/oi` and `/oi_history` endpoints have **NO** `/v2/` aliases. The frontend previously hit `/v2/oi` which returned 404. This was fixed (bug fix #12 in the roadmap). Always use `/oi` and `/oi_history` directly.
+
+---
+
+## Response Caching
+
+Defined in `embedded_api.py` via the `ResponseCache` class. Thread-safe, with dual eviction: TTL-based (expired entries evicted every 100 cache sets) AND LRU-based (`MAX_CACHE_ENTRIES = 500` cap, oldest-accessed evicted when exceeded).
+
+| Endpoint Group | TTL |
+|----------------|-----|
+| Live data (`/oi`, `/market_data`, `/trader_ratios`, `/liq_heatmap_v2`, `/liq_stats`, `/liq_zones*`, `/orderbook_heatmap`) | 5s |
+| History (`/liq_heatmap_v2_history`, `/orderbook_heatmap_history`) | 30s |
+| Stats/debug (`/orderbook_heatmap_stats`) | 10s |
+| `/health`, `/metrics`, `/liq_events`, `/oi_history` | none |
+| Binary responses (`format=bin`) | bypass cache |
+
+**Cache keys are normalized** via `ResponseCache.normalize_cache_key()` — symbols uppercased and truncated, floats rounded to 2dp, side validated to long/short/None, keys >200 chars MD5-hashed. Prevents cardinality explosion from raw user input variations.
+
+**Pre-built default responses:** The 6 default-parameter history responses (3 symbols × 2 types: liq + OB) are pre-computed every 30 seconds on the background `_refresh_loop` thread (`state._prebuilt_liq_history`, `state._prebuilt_ob_history`, protected by `state._prebuilt_lock`). API handlers check incoming request params against defaults; if they match, return the pre-built `JSONResponse` via dict lookup (zero computation). Non-default requests fall through to on-demand computation with the 30s `ResponseCache` TTL. See "Performance Architecture" section below.
 
 ---
 
@@ -73,6 +106,8 @@ These are the endpoints where frontend↔backend bugs are most likely. Each entr
 **Frontend handling:** `fetch_aggregated_oi()` returns `aggregated_oi` as `f32`. The OI pipeline multiplies by price to convert to USD. The `ts` field is in **seconds** (not ms). The `previous_oi`, `oi_delta`, and `oi_delta_pct` fields should be deserialized with `#[serde(default)]`.
 
 **⚠️ UNIT TRAP:** `aggregated_oi` is in base asset (contracts), NOT USD. A value of 170,000 means 170K BTC ≈ $14.3B. The frontend must multiply by close price for USD display.
+
+**Warming up:** Returns 503 (not 404) when poller hasn't produced a first snapshot yet (Sprint 2 H4 fix).
 
 ---
 
@@ -156,11 +191,11 @@ These are the endpoints where frontend↔backend bugs are most likely. Each entr
 
 **Pagination:** `since_ts` is an **exclusive lower bound** — returns events with `ts > since_ts`. To page forward: set `since_ts = newest_ts` from previous response. Always advance the cursor, even if you got `limit` events back.
 
-**Data source:** In-memory deque per symbol, `maxlen=12000`. **Starts empty on backend restart.**
+**Data source:** In-memory deque per symbol, `maxlen=12000`. **Starts empty on backend restart.** Events are normalized via `liq_normalizer.py` before entering the deque — Binance/Bybit side inversion and OKX contract-to-base conversion all handled there.
 
 **Frontend handling:** Per-symbol `LiqPollingState` in `main.rs` tracks cursor (`last_seen_ts`) and dedup `HashSet`. Events bucketed into candle timestamps via `add_liq_events()`.
 
-**⚠️ SIDE SEMANTICS:** `"short"` means a short position was liquidated (forced buy). `"long"` means a long position was liquidated (forced sell). This matches Coinglass convention.
+**⚠️ SIDE SEMANTICS:** `"short"` means a short position was liquidated (forced buy). `"long"` means a long position was liquidated (forced sell). This matches Coinglass convention. Both Binance and Bybit `allLiquidation` feeds report **order side** (not position side), which is inverted in the normalizer. OKX reports position side directly.
 
 **⚠️ CURSOR PROTOCOL:** Always advance cursor to `newest_ts`. The earlier "don't advance when batch is full" approach was wrong — `since_ts` is exclusive, so advancing is correct and prevents re-fetching the same events. Use rapid polling (500ms) during catch-up instead.
 
@@ -252,14 +287,14 @@ These are the endpoints where frontend↔backend bugs are most likely. Each entr
 
 **Frontend struct:** `LiveSnapshot` in `src/chart/liq_heatmap.rs`. Use `#[serde(default)]` for fields not yet consumed.
 
-**⚠️ RECENTLY FIXED:** Clustering was collapsing all buckets into 1 level per side due to greedy chain-merge bug. Fixed March 30 — now uses seed price comparison. Should return multiple levels per side.
+**⚠️ V1 IS REMOVED:** `/liq_heatmap_history` (v1) returns 503 and v1 binary files are deleted on startup. Use `/liq_heatmap_v2_history` exclusively.
 
 ---
 
 ### GET `/liq_heatmap_v2_history?symbol=BTC&minutes=720&stride=1`
 
 **Purpose:** Historical liq heatmap intensity grid for chart overlay rendering.
-**Cache:** 30s TTL.
+**Cache:** 30s TTL. **Default params served from pre-built cache** (zero computation).
 **Alias:** `/v2/liq_heatmap_history`
 
 **Response:**
@@ -289,6 +324,8 @@ These are the endpoints where frontend↔backend bugs are most likely. Each entr
 **Parameters:** `minutes` (5–720, default 720), `stride` (1–30, default 1). Both are clamped server-side.
 
 **Frontend struct:** `HistoryResponse` in `src/chart/liq_heatmap.rs`.
+
+**Data source:** Per-symbol `LiquidationHeatmapBuffer` backed by `liq_heatmap_v2_{SYM}.bin` (4096-byte fixed records, rotated at 50MB to `.old`). Frame objects cache normalized prices via `HistoryFrame._norm_cache` to avoid redundant `_normalize_price` computation across pre-build cycles (PR #52, commit 8e7fc3b — dropped this hot path from 70% of CPU to <0.5%).
 
 ---
 
@@ -350,14 +387,16 @@ These are the endpoints where frontend↔backend bugs are most likely. Each entr
 
 **Frontend struct:** `LiveSnapshot` in `src/chart/orderbook_heatmap.rs`. Use `#[serde(default)]` for per-side stats fields.
 
-**Note:** OB data source is Binance depth stream for all 3 symbols. All symbols (BTC, ETH, SOL) are supported with per-symbol orderbook engines.
+**Note:** OB data source is Binance depth stream for all 3 symbols. Multi-exchange OB aggregation is Phase G (post-beta).
+
+**Input validation (Sprint 1 C5, 3.5 C2):** `step > 0` required (400 if violated). `0 < range_pct <= 1.0` required. Grid capped at `MAX_GRID_BUCKETS = 10000` to prevent DoS via tiny step + wide range (400 if exceeded).
 
 ---
 
 ### GET `/orderbook_heatmap_history?symbol=BTC&minutes=720&stride=1&range_pct=0.10`
 
 **Purpose:** Historical orderbook depth grid.
-**Cache:** 30s TTL (JSON only). Binary format bypasses cache.
+**Cache:** 30s TTL (JSON only). Binary format bypasses cache. **Default params served from pre-built cache.**
 **Alias:** `/v2/orderbook_heatmap_30s_history`
 **Parameters:** `minutes` (5–720), `stride` (1–30), `range_pct`, `step` (auto-resolved if omitted), `format` (`json` or `bin`).
 
@@ -391,6 +430,8 @@ These are the endpoints where frontend↔backend bugs are most likely. Each entr
 
 **Frontend struct:** `HistoryResponse` in `src/chart/orderbook_heatmap.rs`.
 **Note:** `step` is auto-resolved per symbol (BTC=20.0, ETH=1.0, SOL=0.10). Frontend no longer needs to send `step` parameter.
+
+**Incremental pre-build optimization:** If grid shape hasn't shifted since the last pre-build cycle, only new frames are appended to the previous response's arrays (rather than reprocessing all 1440 frames).
 
 ---
 
@@ -499,10 +540,23 @@ These are the endpoints where frontend↔backend bugs are most likely. Each entr
 | Field | Type | Notes |
 |-------|------|-------|
 | `ok` | bool | Always `true` if the server is responding |
-| `uptime_s` | float | Seconds since API server start (`time.time() - start_time`) |
+| `version` | string | Backend version (currently `"3.0.0"`) |
+| `uptime_s` | float | Seconds since API server start (`time.time() - state.start_time`) |
 | `ob_buffers` | dict | Per-symbol boolean — whether OB buffer exists |
 | `symbols` | dict | Per-symbol snapshot availability, timestamps, frame counts |
 | `exchanges` | dict | Per-exchange connection status and last message time |
+
+---
+
+### GET `/metrics`
+
+**Purpose:** Prometheus text exposition format for scraping.
+**Cache:** None.
+**Alias:** None.
+
+Exposes process health (uptime, CPU, memory, threads), per-exchange connection status + message age, WS msg counts by exchange+type, OB levels per symbol + sync status, heatmap frame age/count, OI pipeline health, per-endpoint API request counters with p50/p90/p99 latency quantiles.
+
+Cardinality-bounded: request paths normalized to a `_KNOWN_ROUTES` set (unknown paths bucketed as `"other"`). Label values escaped per Prometheus text format.
 
 ---
 
@@ -547,6 +601,8 @@ These are the endpoints where frontend↔backend bugs are most likely. Each entr
 }
 ```
 
+**Side parameter validation:** `side` is validated via `_validate_side()` — only `long`, `short`, or unset. Invalid values return 400.
+
 ---
 
 ### GET `/liq_zones_summary?symbol=BTC`
@@ -555,7 +611,7 @@ These are the endpoints where frontend↔backend bugs are most likely. Each entr
 **Cache:** 5s TTL.
 **Alias:** `/v3/liq_zones_summary`
 
-Returns the zone manager's summary dict with added `symbol` and `ts` fields. Structure depends on `ActiveZoneManager.get_summary()`.
+Returns the zone manager's summary dict with added `symbol` and `ts` fields.
 
 ---
 
@@ -608,13 +664,13 @@ Returns the zone manager's summary dict with added `symbol` and `ts` fields. Str
 **Cache:** 5s TTL.
 **Alias:** `/v2/liq_stats`
 
-Returns the V2 snapshot's `stats` object with added `symbol`, `snapshot_ts`, `snapshot_age_s`, and `history_frames` fields. Exact stats fields depend on `LiquidationHeatmap.get_stats()`.
+Returns the V2 snapshot's `stats` object with added `symbol`, `snapshot_ts`, `snapshot_age_s`, and `history_frames` fields. `copy.deepcopy()` applied to prevent mutating the cached V2 snapshot (Sprint 1 H5 fix).
 
 ---
 
 ## Aggr-Server Endpoints (proxy.tradenet.org)
 
-These endpoints are used by AGGREGATED tickers for trade data and footprint.
+These endpoints are used by AGGREGATED tickers for trade data, footprint, and bar stats. Served from aggr-server (Node.js, port 3001) via nginx `/aggr/*` location block.
 
 ---
 
@@ -698,20 +754,18 @@ These endpoints are used by AGGREGATED tickers for trade data and footprint.
 - `501` — No compatible storage configured
 - `500` — CVD not yet seeded or internal error
 
-**Examples:** `GET /cvd/btc`, `GET /cvd/ETH`, `GET /cvd/sol`
-
-No query parameters. No authentication beyond existing origin check.
-
 **Frontend handling:** Superseded by `/bar_stats/{symbol}` for live candle polling. This endpoint remains available for standalone CVD-only queries.
 
-**⚠️ DATA SOURCE:** Computed from an in-memory ring buffer (8640 × 10s buckets) updated on every trade batch (~10s). Reconciled against the bar cascade every 5 minutes. Starts empty on restart and seeds from InfluxDB bar cascade on first reconciliation.
+**⚠️ DATA SOURCE:** Computed from an in-memory ring buffer (8640 × 10s buckets) updated on every trade batch (~10s). Reconciled against the bar cascade every 5 minutes. **Known inefficiency:** current `reconcileCVD` is a full re-seed every 5 minutes rather than an incremental update — wastes InfluxDB cycles. Candidate for a ~20-line fix.
+
+**⚠️ EMPTY ON RESTART:** Starts empty on restart and seeds from InfluxDB bar cascade on first reconciliation (up to 5 min delay).
 
 ---
 
 ### GET `/aggr/bar_stats/{symbol}?timeframe=60000`
 
 **Purpose:** Server-authoritative current candle volume, delta, and CVD. Replaces WebSocket-based live bar stats accumulation in the frontend, which was lossy due to network transport and client-side processing delays.
-**Poll interval:** 250-500ms from the frontend.
+**Poll interval:** 250ms from the frontend per (symbol, timeframe).
 **Cache:** None — pure in-memory read on every request.
 
 **Parameters:**
@@ -760,11 +814,13 @@ GET /bar_stats/ETH?timeframe=900000   → 15m candle stats
 
 **How timeframe works:** The server maintains a 60-entry ring of 1-minute buckets per symbol, updated on every trade in real-time. When a timeframe is requested, the server computes the current candle's time window (e.g. 5m = `floor(now / 300000) * 300000`) and sums all 1-minute buckets within that window. Any timeframe that is a multiple of 1 minute works, up to 60 minutes (limited by ring depth). For timeframes > 60m, only the most recent 60 minutes of the candle will be included.
 
-**Frontend handling:** Poll every 250-500ms. Use `vol_buy`, `vol_sell`, `delta` as the authoritative values for the live candle's bar stats. Use `cvd_24h` for the 24H CVD display. On candle close (when `candle_ts` changes), the previous candle's final values are available from the next `/footprint` fetch. The aggr-WS is still used for live OHLC and footprint level rendering — only volume/delta/CVD stats come from this endpoint.
+**Frontend handling:** Poll every 250ms per (symbol, timeframe). Use `vol_buy`, `vol_sell`, `delta` as the authoritative values for the live candle's bar stats. Use `cvd_24h` for the 24H CVD display. On candle close (when `candle_ts` changes), the previous candle's final values are available from the next `/footprint` fetch. The aggr-WS is still used for live OHLC and footprint level rendering — only volume/delta/CVD stats come from this endpoint.
 
 **⚠️ DATA SOURCE:** Fed directly by `dispatchRawTrades` on every exchange WebSocket message (same trade flow that feeds InfluxDB and the WS broadcast). Not batched — every trade is accumulated immediately. Starts empty on restart and fills from the first trade received.
 
 **⚠️ TIMEFRAME > 60m:** The ring buffer stores 60 one-minute buckets. For timeframes longer than 60 minutes (e.g. 4h candles), the endpoint returns volume from only the most recent 60 minutes of the candle, not the full candle. Use `/footprint` for full historical candle data.
+
+**⚠️ SCALING NOTE:** 250ms polling per pane per timeframe is the dominant InfluxDB load driver in production. When panes subscribe to different timeframes, InfluxDB CPU scales from ~10% baseline to 90-120%. Planned mitigations: frontend request dedupe across panes on same (symbol, timeframe), server-side TTL cache of 2-5s on this endpoint.
 
 ---
 
@@ -778,71 +834,36 @@ GET /bar_stats/ETH?timeframe=900000   → 15m candle stats
 
 ---
 
-### GET `/aggr/metrics`
+## Performance Architecture
 
-**Purpose:** Prometheus text exposition format metrics for monitoring aggr-server health and throughput. Scraped by Prometheus every 15 seconds from the backend monitoring server.
-**Cache:** None — rendered on every request from in-memory state.
-**Content-Type:** `text/plain; version=0.0.4; charset=utf-8`
-**CORS:** Bypasses the origin check — always accessible for monitoring scrapers.
+The backend has several CPU optimizations that affect how requests are served. Frontend behavior should align with these.
 
-**Metrics exposed:**
+### Pre-built history responses
 
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `aggr_uptime_seconds` | gauge | — | Process uptime since startup |
-| `aggr_memory_rss_bytes` | gauge | — | Resident set size of the Node.js process |
-| `aggr_exchange_connected` | gauge | `exchange`, `symbol` | 1 if the exchange:pair has an active API connection, 0 otherwise |
-| `aggr_exchange_last_message_age_seconds` | gauge | `exchange`, `symbol` | Seconds since last trade received on this exchange:pair (-1 if never) |
-| `aggr_trades_total` | counter | `symbol` | Total trades received per BTC/ETH/SOL since process start |
-| `aggr_trades_per_second` | gauge | `symbol` | Rolling 60-second average trades/sec per symbol |
-| `aggr_influx_write_duration_ms` | gauge | — | Duration of the most recent InfluxDB writePoints call |
-| `aggr_influx_resample_duration_ms` | gauge | — | Duration of the most recent bar cascade resample |
-| `aggr_bar_stats_vol_buy` | gauge | `symbol` | Current 1-minute candle vol_buy in USD |
-| `aggr_bar_stats_vol_sell` | gauge | `symbol` | Current 1-minute candle vol_sell in USD |
-| `aggr_bar_stats_candle_ts` | gauge | `symbol` | Current 1-minute candle opening timestamp (ms) |
-| `aggr_cvd_24h` | gauge | `symbol` | Current rolling 24-hour CVD in USD |
-| `aggr_cvd_ring_entries` | gauge | `symbol` | Number of non-zero entries in the CVD ring buffer (out of 8640) |
-| `aggr_ws_clients_total` | gauge | — | Currently connected WebSocket clients |
-| `aggr_ws_broadcast_total` | counter | `symbol` | Total WebSocket broadcasts sent per symbol |
-| `aggr_api_requests_total` | counter | `endpoint` | Total HTTP API requests per normalized endpoint |
-| `aggr_api_request_duration_seconds` | summary | `endpoint`, `quantile` | p50/p90/p99 request duration over last 1000 requests per endpoint |
+To avoid recomputing 720 liq frames × ~800 prices or 1440 OB frames × ~300 prices on every cache-miss, the background `_refresh_loop` thread pre-builds all 6 default-parameter history responses (3 symbols × 2 types) every 30 seconds:
 
-**Endpoint label normalization:** API request labels collapse path parameters to the route prefix to keep cardinality bounded. For example, `/footprint/BTC/123/456/60000` and `/footprint/ETH/789/1000/300000` both report as `endpoint="/footprint"`. The first path segment becomes the label.
+- liq defaults: `minutes=720, stride=1`
+- OB defaults: `minutes=720, stride=1, step=None (auto), price_min=None, price_max=None, format=json`
 
-**Example output:**
-```
-# HELP aggr_uptime_seconds Process uptime in seconds
-# TYPE aggr_uptime_seconds gauge
-aggr_uptime_seconds 86400
-# HELP aggr_memory_rss_bytes Resident set size of the Node.js process in bytes
-# TYPE aggr_memory_rss_bytes gauge
-aggr_memory_rss_bytes 234881024
-# HELP aggr_exchange_connected 1 if the exchange:pair has an active API connection, 0 otherwise
-# TYPE aggr_exchange_connected gauge
-aggr_exchange_connected{exchange="BINANCE_FUTURES",symbol="btcusdt"} 1
-aggr_exchange_connected{exchange="BYBIT",symbol="BTCUSDT"} 1
-aggr_exchange_connected{exchange="OKEX",symbol="BTC-USDT-SWAP"} 1
-aggr_exchange_connected{exchange="HYPERLIQUID",symbol="BTC"} 1
-# HELP aggr_trades_total Total number of trades received per symbol since process start
-# TYPE aggr_trades_total counter
-aggr_trades_total{symbol="BTC"} 1523847
-aggr_trades_total{symbol="ETH"} 982341
-aggr_trades_total{symbol="SOL"} 451029
-# HELP aggr_cvd_24h Current rolling 24-hour cumulative volume delta in USD
-# TYPE aggr_cvd_24h gauge
-aggr_cvd_24h{symbol="BTC"} -119061244.13
-aggr_cvd_24h{symbol="ETH"} 355967970.57
-aggr_cvd_24h{symbol="SOL"} -57146714.68
-# HELP aggr_api_request_duration_seconds API request duration in seconds, p50/p90/p99 from last 1000 requests per endpoint
-# TYPE aggr_api_request_duration_seconds summary
-aggr_api_request_duration_seconds{endpoint="/bar_stats",quantile="0.5"} 0.002
-aggr_api_request_duration_seconds{endpoint="/bar_stats",quantile="0.9"} 0.005
-aggr_api_request_duration_seconds{endpoint="/bar_stats",quantile="0.99"} 0.012
-```
+Default-param requests are served as dict lookups (zero computation). Non-default requests fall through to on-demand computation with the 30s `ResponseCache` TTL.
 
-**⚠️ EXCHANGE LABEL VALUES:** The `exchange` label uses the raw aggr-server exchange ID (e.g. `BINANCE_FUTURES`, `BYBIT`, `OKEX`, `HYPERLIQUID`), not the simplified `binance`/`bybit`/`okx` form used by other backend endpoints. The `symbol` label is the raw pair string (e.g. `btcusdt`, `BTCUSDT`, `BTC-USDT-SWAP`, `BTC`), not the short symbol.
+**Frontend guidance:** Use default parameters for history requests whenever possible. Varying params unnecessarily (e.g. different stride values per pane) defeats the cache.
 
-**⚠️ TRADES_PER_SECOND WARMUP:** The rolling 60s average is computed from a buckets array that starts empty. For the first 60 seconds after process start, the rate may be artificially low. After 60 seconds, it stabilizes.
+### OB reconstructor hard cap
+
+The `OrderbookReconstructor` enforces a hard cap of **2000 levels per side** (`_MAX_LEVELS_PER_SIDE`) and rejects level inserts outside **±10% of current mid** (`_INSERT_RANGE_PCT = 0.10`). This prevents unbounded growth from stale phantom levels accumulating through missed zero-qty removals over long uptimes.
+
+Level eviction uses `heapq.nlargest` on distance-from-mid keys, run **once per side per diff** (not per level — PR #54). Was previously a 24% py-spy CPU hotspot; now <0.5%.
+
+**Frontend impact:** OB heatmap always reflects the top-2000-levels-per-side view. In theory this can clip extreme far-from-price levels during sustained strong trends, but in practice 2000 levels covers ±10% of mid which is more than enough for all current display use cases.
+
+### HistoryFrame normalized price cache
+
+`HistoryFrame` objects cache normalized prices via lazy `_norm_cache: Dict[tuple, List[float]]` keyed by `(step, ndigits)`. First call computes and stores; subsequent calls reuse. Cut `_normalize_price` from 70% → <0.5% of pre-build CPU (PR #52, commit 8e7fc3b).
+
+### OB feed-on-emit (not feed-on-diff)
+
+The `OrderbookAccumulator` no longer receives callbacks on every depth diff. Instead, a lightweight `check_emit()` boundary check runs ~6/sec and pulls book state via closures only when a new 30-second slot crosses. Reduced `get_full_book + on_depth_update + _bucket_price` chain from 6 calls/sec/symbol to 1 call per 30s per symbol (PR #42).
 
 ---
 
@@ -857,9 +878,8 @@ Both the backend and aggr-server have data that **starts empty on restart** and 
 | Raw trades | Aggr-server InfluxDB `aggr_raw` | 12 hours | Tick-level | No footprint data beyond 12h |
 | CVD accumulator | Aggr-server in-memory | 24 hours | ~10s updates | `cvd_24h` is 0 on restart until first bar cascade reconciliation (~5min) |
 | Bar stats ring | Aggr-server in-memory | 60 minutes | Per-trade | `/bar_stats` returns zeros on restart until first trade. Timeframes >60m show partial data. |
-| Metrics counters | Aggr-server in-memory | Process lifetime | Per-event | All `aggr_*_total` counters reset on restart. API duration arrays hold last 1000 per endpoint. |
-| Liq heatmap history | Backend binary buffer | ~720 frames | 1 per minute | ~12 hours of heatmap overlay |
-| OB heatmap history | Backend binary buffer | ~1440 frames | 1 per 30s | ~12 hours of OB overlay |
+| Liq heatmap history | Backend binary buffer | ~720 frames | 1 per minute | ~12 hours of heatmap overlay. Persisted to `liq_heatmap_v2_{SYM}.bin` (4KB records, rotated at 50MB). |
+| OB heatmap history | Backend binary buffer | ~1440 frames | 1 per 30s | ~12 hours of OB overlay. Persisted to `ob_heatmap_30s_{SYM}.bin`. |
 
 **After a backend restart**, OI history and liq events are empty. The frontend will see zero OI delta/CVD and zero liq data until the buffers refill. This is expected behavior, not a bug. The frontend should handle empty/short responses gracefully.
 
@@ -881,6 +901,14 @@ Both the backend and aggr-server have data that **starts empty on restart** and 
 
 7. **`/liq_heatmap_v2_history` has no USD arrays.** The endpoint only returns u8 intensity grids (`long`/`short`). There are no `long_usd`/`short_usd` fields. Similarly, `/orderbook_heatmap_history` has no `bid_btc`/`ask_btc`/`bid_usd`/`ask_usd` fields.
 
+8. **Default-parameter history requests are nearly free; non-default are not.** Pre-built cache serves default params as a dict lookup. Any deviation (custom stride, minutes, etc.) falls through to on-demand computation. Multi-pane frontend should share default-param history requests across panes on the same symbol rather than parameterizing per-pane.
+
+9. **`/aggr/bar_stats` is the dominant backend workload.** Frontend currently polls at 250ms per pane per timeframe and hits aggr-server → InfluxDB. Without client-side dedupe across panes on the same `(symbol, timeframe)`, this saturates InfluxDB at 5+ active panes. Planned: dedupe + server-side TTL cache.
+
+10. **Aggr-server `reconcileCVD` is a full re-seed every 5 minutes.** Known inefficiency. Each reconciliation re-reads the full 24h bar cascade instead of incrementally updating the last 5 min of buckets. Candidate for a ~20-line aggr-server patch.
+
+11. **Backend pre-build loops (`_refresh_loop`, `_prebuild_ob_history`) run every 30s regardless of subscriber count.** Causes 35-40% Python CPU baseline even with zero active clients. Planned: subscriber-gated pre-builds + incremental append (only new frames, not full 12h rebuild).
+
 ---
 
 ## Rules
@@ -890,4 +918,6 @@ Both the backend and aggr-server have data that **starts empty on restart** and 
 3. **Units must be explicitly stated** — never assume USD vs base asset vs contracts.
 4. **Timestamps must specify ms vs seconds** — the backend uses both (ms for events/history, seconds for `/oi` ts field).
 5. **All optional fields use `#[serde(default)]` on the frontend** — backend may add fields without breaking the parser.
-6. **Test with `curl` before writing frontend code** — never trust documentation alone (NEVER DO rule #7).
+6. **Test with `curl` before writing frontend code** — never trust documentation alone.
+7. **Prefer default history parameters** — non-default params bypass the pre-build cache and hit on-demand computation.
+8. **Dedupe requests across panes** — multiple panes viewing the same `(symbol, timeframe)` should share a single request stream for bar stats, OI, heatmap history, etc.
